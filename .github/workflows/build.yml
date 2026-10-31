@@ -10,7 +10,7 @@ permissions:
 jobs:
   build:
     name: Build iOS ARM64
-    runs-on: macos-14
+    runs-on: macos-15
 
     steps:
       # 1. Récupérer les fichiers du dépôt
