@@ -24,7 +24,7 @@ jobs:
           clang++ --version
           xcrun --sdk iphoneos --show-sdk-path
 
-      # 3. Télécharger l'IPA via Pixeldrain API
+      # 3. Télécharger l'IPA via Pixeldrain API avec headers complets
       - name: Download Grand Battle Royale IPA
         env:
           PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
@@ -36,10 +36,15 @@ jobs:
             --connect-timeout 30 \
             --max-time 600 \
             -u ":$PD_KEY" \
+            -H "User-Agent: Mozilla/5.0 (iPad; CPU OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0 Mobile/15E148 Safari/604.1" \
+            -H "Accept: application/vnd.pixeldrain.v1+json, */*" \
             "https://pixeldrain.com/api/file/M3CmVwZ3" \
             -o output/GrandBattleRoyale.ipa
 
           test -s output/GrandBattleRoyale.ipa
+          echo "=== IPA Downloaded Successfully ==="
+          ls -lh output/GrandBattleRoyale.ipa
+
 
           echo "=== IPA Downloaded Successfully ==="
           ls -lh output/GrandBattleRoyale.ipa
