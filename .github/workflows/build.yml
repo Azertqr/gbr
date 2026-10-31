@@ -68,6 +68,7 @@ jobs:
             -Wno-deprecated-declarations \
             -framework UIKit \
             -framework Foundation \
+            -framework CoreGraphics \
             -install_name @rpath/NyxMenuGBR.dylib \
             -o output/NyxMenuGBR.dylib \
             Tweak.mm
