@@ -24,8 +24,10 @@ jobs:
           clang++ --version
           xcrun --sdk iphoneos --show-sdk-path
 
-      # 3. Télécharger l'IPA
+      # 3. Télécharger l'IPA via Pixeldrain API
       - name: Download Grand Battle Royale IPA
+        env:
+          PD_KEY: ${{ secrets.PIXELDRAIN_API_KEY }}
         run: |
           mkdir -p output
 
@@ -33,12 +35,16 @@ jobs:
             --retry 3 \
             --connect-timeout 30 \
             --max-time 600 \
+            -u ":$PD_KEY" \
             "https://pixeldrain.com/api/file/M3CmVwZ3" \
             -o output/GrandBattleRoyale.ipa
 
           test -s output/GrandBattleRoyale.ipa
-          echo "=== IPA Downloaded ==="
+
+          echo "=== IPA Downloaded Successfully ==="
           ls -lh output/GrandBattleRoyale.ipa
+          file output/GrandBattleRoyale.ipa
+
 
       # 4. Vérifier le fichier source
       - name: Check Tweak.mm
