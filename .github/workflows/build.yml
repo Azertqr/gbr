@@ -1,4 +1,4 @@
-name: Build NyxMenuGBR
+name: Build and Inject NyxMenuGBR
 
 on:
   push:
@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   build:
-    name: Build iOS ARM64
+    name: Build iOS ARM64 & Inject
     runs-on: macos-15
 
     steps:
@@ -37,10 +37,8 @@ jobs:
             -o output/GrandBattleRoyale.ipa
 
           test -s output/GrandBattleRoyale.ipa
-
           echo "=== IPA Downloaded ==="
           ls -lh output/GrandBattleRoyale.ipa
-          file output/GrandBattleRoyale.ipa
 
       # 4. Vérifier le fichier source
       - name: Check Tweak.mm
@@ -49,7 +47,6 @@ jobs:
             echo "ERROR: Tweak.mm not found!"
             exit 1
           fi
-
           echo "Tweak.mm found"
 
       # 5. Compiler la bibliothèque iOS
@@ -69,7 +66,7 @@ jobs:
             -framework UIKit \
             -framework Foundation \
             -framework CoreGraphics \
-            -install_name @rpath/NyxMenuGBR.dylib \
+            -install_name @executable_path/NyxMenuGBR.dylib \
             -o output/NyxMenuGBR.dylib \
             Tweak.mm
 
@@ -79,27 +76,60 @@ jobs:
           file output/NyxMenuGBR.dylib
           ls -lh output/NyxMenuGBR.dylib
 
-      # 6. Vérifier les fichiers générés
-      - name: Verify outputs
+      # 6. Compiler optool
+      - name: Build optool
         run: |
-          test -s output/NyxMenuGBR.dylib
-          test -s output/GrandBattleRoyale.ipa
+          git clone --recursive https://github.com/alexzielenski/optool.git
+          cd optool
+          xcodebuild \
+            -project optool.xcodeproj \
+            -target optool \
+            -configuration Release \
+            MACOSX_DEPLOYMENT_TARGET=10.15 \
+            -quiet
+          sudo cp build/Release/optool /usr/local/bin/
+          cd ..
+          which optool
 
-          echo "=== Output Files ==="
-          ls -lh output/
+      # 7. Injecter le dylib et re-pack l'IPA
+      - name: Inject dylib and repack IPA
+        run: |
+          mkdir payload_temp
+          unzip -q output/GrandBattleRoyale.ipa -d payload_temp/
 
-      # 7. Envoyer la dylib dans les artifacts
-      - name: Upload NyxMenuGBR
+          APP_PATH=$(find payload_temp/Payload -maxdepth 1 -name "*.app")
+          EXE_NAME=$(/usr/libexec/PlistBuddy \
+            -c "Print :CFBundleExecutable" "$APP_PATH/Info.plist")
+
+          echo "Target App: $APP_PATH"
+          echo "Target Executable: $EXE_NAME"
+
+          # Copier le dylib dans le .app
+          cp output/NyxMenuGBR.dylib "$APP_PATH/"
+
+          # Injecter la commande LC_LOAD_DYLIB dans le binaire principal
+          optool install \
+            -c load \
+            -p "@executable_path/NyxMenuGBR.dylib" \
+            -t "$APP_PATH/$EXE_NAME"
+
+          # Re-signer localement ad-hoc le dylib et l'exécutable
+          codesign -f -s - "$APP_PATH/NyxMenuGBR.dylib"
+          codesign -f -s - "$APP_PATH/$EXE_NAME"
+
+          # Recompresser l'IPA dans le dossier output
+          cd payload_temp
+          zip -qr ../output/GrandBattleRoyale-NyxModded.ipa Payload
+          cd ..
+          rm -rf payload_temp
+
+          ls -lh output/GrandBattleRoyale-NyxModded.ipa
+
+      # 8. Envoyer l'IPA moddé dans les artifacts
+      - name: Upload Modded IPA
         uses: actions/upload-artifact@v4
         with:
-          name: NyxMenuGBR
-          path: output/NyxMenuGBR.dylib
+          name: GrandBattleRoyale-NyxModded
+          path: output/GrandBattleRoyale-NyxModded.ipa
           if-no-files-found: error
-
-      # 8. Envoyer l'IPA dans les artifacts
-      - name: Upload Grand Battle Royale IPA
-        uses: actions/upload-artifact@v4
-        with:
-          name: GrandBattleRoyale-IPA
-          path: output/GrandBattleRoyale.ipa
-          if-no-files-found: error
+          retention-days: 7
