@@ -16,8 +16,69 @@
 #import <Foundation/Foundation.h>
 #include <dlfcn.h>
 #include <stdint.h>
+#include <string.h>
 #include <string>
 #include <vector>
+#include <mach-o/dyld.h>
+#include <mach-o/loader.h>
+#include <mach-o/nlist.h>
+
+// ---- Lecteur de table de symboles Mach-O (repli quand dlsym echoue) ----
+// Sur un build App Store, les symboles il2cpp_* existent dans le binaire mais ne sont
+// pas toujours exportes publiquement : dlsym (meme via dlopen) ne les voit pas. On lit
+// directement la LC_SYMTAB de l'image en memoire, qui liste TOUS les symboles.
+static void* FindSymbolInImage(uint32_t imageIndex, const char* symbolName) {
+    const struct mach_header_64* header =
+        (const struct mach_header_64*)_dyld_get_image_header(imageIndex);
+    if (!header) return nullptr;
+    intptr_t slide = _dyld_get_image_vmaddr_slide(imageIndex);
+
+    const struct symtab_command* symtab = nullptr;
+    const struct segment_command_64* linkedit = nullptr;
+    const struct segment_command_64* text = nullptr;
+
+    const uint8_t* cur = (const uint8_t*)header + sizeof(struct mach_header_64);
+    for (uint32_t i = 0; i < header->ncmds; i++) {
+        const struct load_command* lc = (const struct load_command*)cur;
+        if (lc->cmd == LC_SYMTAB) symtab = (const struct symtab_command*)lc;
+        else if (lc->cmd == LC_SEGMENT_64) {
+            const struct segment_command_64* seg = (const struct segment_command_64*)lc;
+            if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit = seg;
+            else if (strcmp(seg->segname, "__TEXT") == 0) text = seg;
+        }
+        cur += lc->cmdsize;
+    }
+    if (!symtab || !linkedit || !text) return nullptr;
+    (void)text;   // juste utilise pour confirmer que l'image a bien un __TEXT (executable valide)
+
+    uintptr_t linkeditBase = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
+
+    const struct nlist_64* syms = (const struct nlist_64*)(linkeditBase + symtab->symoff);
+    const char* strs = (const char*)(linkeditBase + symtab->stroff);
+
+    for (uint32_t i = 0; i < symtab->nsyms; i++) {
+        uint32_t strx = syms[i].n_un.n_strx;
+        if (strx == 0) continue;
+        const char* name = strs + strx;
+        // les symboles C ont un '_' devant dans la table Mach-O
+        if (name[0] == '_' && strcmp(name + 1, symbolName) == 0) {
+            if (syms[i].n_value == 0) continue;   // symbole non defini (import)
+            return (void*)((uintptr_t)syms[i].n_value + slide);
+        }
+    }
+    return nullptr;
+}
+
+// Cherche dans toutes les images chargees (l'executable principal est generalement
+// l'index 0, mais on balaie tout par securite).
+static void* FindSymbolAnywhere(const char* symbolName) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        void* r = FindSymbolInImage(i, symbolName);
+        if (r) return r;
+    }
+    return nullptr;
+}
 
 // ============================ CORE BEGIN ============================
 
@@ -69,6 +130,7 @@ static bool loadAPI() {
 #define NYX_LOAD(f) \
     A.f = (fn_##f)dlsym(h, "il2cpp_" #f); \
     if (!A.f && hMain) A.f = (fn_##f)dlsym(hMain, "il2cpp_" #f); \
+    if (!A.f) A.f = (fn_##f)FindSymbolAnywhere("il2cpp_" #f); \
     if (!A.f) { g_lastMissingSymbol = "il2cpp_" #f; return false; }
     NYX_LOAD(domain_get)
     NYX_LOAD(domain_assembly_open)
@@ -407,7 +469,7 @@ static UIWindow* gameWindow() {
     c.x = MAX(23, MIN(self.host.bounds.size.width - 23, c.x + t.x));
     c.y = MAX(23, MIN(self.host.bounds.size.height - 23, c.y + t.y));
     self.fab.center = c;
-    [gr setTranslation:CGPointZero inView:self.host];
+    [gr setTranslation:CGPointMake(0, 0) inView:self.host];
 }
 
 - (void)sw:(UISwitch*)s {
