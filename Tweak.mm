@@ -20,135 +20,40 @@
 #include <string>
 #include <vector>
 #include <mach-o/dyld.h>
-#include <mach-o/loader.h>
-#include <mach-o/nlist.h>
-
-// ---- Lecteur de table de symboles Mach-O (repli quand dlsym echoue) ----
-// Sur un build App Store, les symboles il2cpp_* existent dans le binaire mais ne sont
-// pas toujours exportes publiquement : dlsym (meme via dlopen) ne les voit pas. On lit
-// directement la LC_SYMTAB de l'image en memoire, qui liste TOUS les symboles.
-static void* FindSymbolInImage(uint32_t imageIndex, const char* symbolName) {
-    const struct mach_header_64* header =
-        (const struct mach_header_64*)_dyld_get_image_header(imageIndex);
-    if (!header) return nullptr;
-    intptr_t slide = _dyld_get_image_vmaddr_slide(imageIndex);
-
-    const struct symtab_command* symtab = nullptr;
-    const struct segment_command_64* linkedit = nullptr;
-    const struct segment_command_64* text = nullptr;
-
-    const uint8_t* cur = (const uint8_t*)header + sizeof(struct mach_header_64);
-    for (uint32_t i = 0; i < header->ncmds; i++) {
-        const struct load_command* lc = (const struct load_command*)cur;
-        if (lc->cmd == LC_SYMTAB) symtab = (const struct symtab_command*)lc;
-        else if (lc->cmd == LC_SEGMENT_64) {
-            const struct segment_command_64* seg = (const struct segment_command_64*)lc;
-            if (strcmp(seg->segname, "__LINKEDIT") == 0) linkedit = seg;
-            else if (strcmp(seg->segname, "__TEXT") == 0) text = seg;
-        }
-        cur += lc->cmdsize;
-    }
-    if (!symtab || !linkedit || !text) return nullptr;
-    (void)text;   // juste utilise pour confirmer que l'image a bien un __TEXT (executable valide)
-
-    uintptr_t linkeditBase = (uintptr_t)slide + linkedit->vmaddr - linkedit->fileoff;
-
-    const struct nlist_64* syms = (const struct nlist_64*)(linkeditBase + symtab->symoff);
-    const char* strs = (const char*)(linkeditBase + symtab->stroff);
-
-    for (uint32_t i = 0; i < symtab->nsyms; i++) {
-        uint32_t strx = syms[i].n_un.n_strx;
-        if (strx == 0) continue;
-        const char* name = strs + strx;
-        // les symboles C ont un '_' devant dans la table Mach-O
-        if (name[0] == '_' && strcmp(name + 1, symbolName) == 0) {
-            if (syms[i].n_value == 0) continue;   // symbole non defini (import)
-            return (void*)((uintptr_t)syms[i].n_value + slide);
-        }
-    }
-    return nullptr;
-}
-
-// Cherche dans toutes les images chargees (l'executable principal est generalement
-// l'index 0, mais on balaie tout par securite).
-static void* FindSymbolAnywhere(const char* symbolName) {
-    uint32_t n = _dyld_image_count();
-    for (uint32_t i = 0; i < n; i++) {
-        void* r = FindSymbolInImage(i, symbolName);
-        if (r) return r;
-    }
-    return nullptr;
-}
 
 // ============================ CORE BEGIN ============================
 
-typedef void*  (*fn_domain_get)(void);
-typedef void*  (*fn_domain_assembly_open)(void*, const char*);
-typedef void*  (*fn_assembly_get_image)(void*);
-typedef void*  (*fn_class_from_name)(void*, const char*, const char*);
-typedef void*  (*fn_class_get_field_from_name)(void*, const char*);
-typedef void*  (*fn_class_get_fields)(void*, void**);
-typedef size_t (*fn_field_get_offset)(void*);
-typedef const char* (*fn_field_get_name)(void*);
-typedef void*  (*fn_field_static_get_value)(void*, void*);   // signature reelle : (field, out void*)
-typedef void*  (*fn_class_get_method_from_name)(void*, const char*, int);
-typedef void*  (*fn_class_get_methods)(void*, void**);
-typedef const char* (*fn_method_get_name)(void*);
-typedef uint32_t (*fn_method_get_param_count)(void*);
-typedef void*  (*fn_runtime_invoke)(void*, void*, void**, void**);
-typedef void*  (*fn_thread_attach)(void*);
+// L'API publique il2cpp_* a ete retiree du binaire a la publication (verifie en lisant
+// le vrai fichier "gbr" : LC_SYMTAB existe mais ne contient que des symboles
+// PLCrashReporter, aucun il2cpp_*). Inutile de la chercher par son nom.
+// A la place, on appelle directement les fonctions du jeu par leur adresse, calculee
+// comme (base de chargement de "gbr") + (RVA retrouvee dans dump_1.cs). La base de
+// chargement se trouve via l'API publique dyld, qui ne depend d'aucun symbole du jeu.
 
-static struct {
-    fn_domain_get                 domain_get;
-    fn_domain_assembly_open       domain_assembly_open;
-    fn_assembly_get_image         assembly_get_image;
-    fn_class_from_name            class_from_name;
-    fn_class_get_field_from_name  class_get_field_from_name;
-    fn_class_get_fields           class_get_fields;
-    fn_field_get_offset           field_get_offset;
-    fn_field_get_name             field_get_name;
-    fn_field_static_get_value     field_static_get_value;
-    fn_class_get_method_from_name class_get_method_from_name;
-    fn_class_get_methods          class_get_methods;
-    fn_method_get_name            method_get_name;
-    fn_method_get_param_count     method_get_param_count;
-    fn_runtime_invoke             runtime_invoke;
-    fn_thread_attach              thread_attach;
-} A;
+typedef void* (*fn_getGameInstance)(void);   // getter statique Game.Instance, 0 argument
 
-static bool g_apiLoaded = false;
+static uintptr_t g_gbrBase = 0;       // adresse de chargement de l'image "gbr" (ASLR deja applique)
 static std::string g_lastMissingSymbol;
 
+// RVA retrouvees dans dump_1.cs pour Grand Battle Royale 3.5.2.
+// A revoir si le jeu est mis a jour (refaire le dump, rechercher la meme methode).
+static const uintptr_t RVA_GAME_INSTANCE_GETTER = 0x19138DC;
+
+static uintptr_t FindImageBase(const char* needle) {
+    uint32_t n = _dyld_image_count();
+    for (uint32_t i = 0; i < n; i++) {
+        const char* name = _dyld_get_image_name(i);
+        if (name && strstr(name, needle)) return (uintptr_t)_dyld_get_image_header(i);
+    }
+    return 0;
+}
+
 static bool loadAPI() {
-    if (g_apiLoaded) return true;
-    // RTLD_DEFAULT ne cherche pas toujours correctement dans l'executable principal
-    // quand le moteur Unity est embarque directement dedans (pas de UnityFramework.framework
-    // separe, comme c'est le cas ici : tout est dans "gbr"). On demande explicitement le
-    // handle de l'executable principal en secours.
-    void* h = RTLD_DEFAULT;
-    void* hMain = dlopen(nullptr, RTLD_NOW | RTLD_GLOBAL);
-#define NYX_LOAD(f) \
-    A.f = (fn_##f)dlsym(h, "il2cpp_" #f); \
-    if (!A.f && hMain) A.f = (fn_##f)dlsym(hMain, "il2cpp_" #f); \
-    if (!A.f) A.f = (fn_##f)FindSymbolAnywhere("il2cpp_" #f); \
-    if (!A.f) { g_lastMissingSymbol = "il2cpp_" #f; return false; }
-    NYX_LOAD(domain_get)
-    NYX_LOAD(domain_assembly_open)
-    NYX_LOAD(assembly_get_image)
-    NYX_LOAD(class_from_name)
-    NYX_LOAD(class_get_field_from_name)
-    NYX_LOAD(field_get_offset)
-    NYX_LOAD(field_static_get_value)
-    NYX_LOAD(class_get_method_from_name)
-    NYX_LOAD(runtime_invoke)
-#undef NYX_LOAD
-    A.class_get_fields       = (fn_class_get_fields)dlsym(h, "il2cpp_class_get_fields");
-    A.field_get_name         = (fn_field_get_name)dlsym(h, "il2cpp_field_get_name");
-    A.class_get_methods      = (fn_class_get_methods)dlsym(h, "il2cpp_class_get_methods");
-    A.method_get_name        = (fn_method_get_name)dlsym(h, "il2cpp_method_get_name");
-    A.method_get_param_count = (fn_method_get_param_count)dlsym(h, "il2cpp_method_get_param_count");
-    A.thread_attach          = (fn_thread_attach)dlsym(h, "il2cpp_thread_attach");
-    g_apiLoaded = true;
+    if (g_gbrBase) return true;
+    // le binaire principal du jeu s'appelle "gbr" (pas de UnityFramework separe) ;
+    // son chemin dans le bundle est .../gbr.app/gbr
+    g_gbrBase = FindImageBase("/gbr");
+    if (!g_gbrBase) { g_lastMissingSymbol = "image gbr pas encore chargee"; return false; }
     return true;
 }
 
@@ -162,127 +67,55 @@ static std::string g_status = "en attente du jeu...";
 
 static struct {
     bool ready = false;
-    void* domain = nullptr;
-    void *cItem = nullptr, *cNP = nullptr, *cGame = nullptr, *cPV = nullptr;
-    int it_MaxAmmo = -1, it_CurAmmo = -1, it_Damage = -1;
-    int np_Items = -1;
-    int game_Players = -1;
-    void* f_gameInst = nullptr;   // champ statique "Game" trouve par structure (self-type)
-    void* m_rpcInvoke = nullptr;  // PhotonView.RPC(string, PhotonTargets, object[]) trouve par signature
+    void* f_gameInst = nullptr;   // pointeur Game.Instance, obtenu en appelant son getter
+    // offsets de champs verifies (identiques entre le mod Android et ce dump iOS,
+    // meme version Unity/IL2CPP, meme disposition memoire 64 bits) :
+    int game_Players = 0x28;   // Game.players : List<NetworkPlayer>
+    int np_Items     = 0x58;   // NetworkPlayer.items : Item[]
+    int it_MaxAmmo   = 0x44;   // Item.maxAmo
+    int it_CurAmmo   = 0x48;   // Item.currAmo
+    int it_Damage    = 0x50;   // Item.itemDamage
 } g;
 
 template <typename T> static inline T rd(void* o, int off) { return *(T*)((uint8_t*)o + off); }
 template <typename T> static inline void wr(void* o, int off, T v) { *(T*)((uint8_t*)o + off) = v; }
 
-static int FO(void* klass, const char* name) {
-    if (!klass) return -1;
-    void* f = A.class_get_field_from_name(klass, name);
-    return f ? (int)A.field_get_offset(f) : -1;
-}
-
-// Trouve un champ STATIQUE de `klass` dont le TYPE est `klass` lui-meme : c'est le motif
-// classique d'un singleton Unity (`private static Game <Instance>k__BackingField`), meme
-// quand le nom du champ est scramble par l'obfuscateur — ici on ne cherche pas le nom,
-// on cherche la forme.
-static void* FindSelfTypeStaticField(void* klass, const char* className) {
-    if (!klass || !A.class_get_fields) return nullptr;
-    void* iter = nullptr; void* f = nullptr;
-    while ((f = A.class_get_fields(klass, &iter)) != nullptr) {
-        // offset 0x0 ET nom de champ qui commence par '<' (backing field auto-genere) :
-        // suffisant ici vu qu'un seul champ statique de ce type existe dans Game.
-        if (A.field_get_offset(f) == 0) {
-            const char* nm = A.field_get_name ? A.field_get_name(f) : nullptr;
-            if (nm && nm[0] == '<') return f;
-        }
-    }
-    (void)className;
-    return nullptr;
-}
-
-// Trouve PhotonView.RPC(string, PhotonTargets, object[]) par SA SIGNATURE (3 parametres),
-// parce que son nom reel est scramble comme le reste du code du jeu.
-static void* FindPhotonRPC(void* klass) {
-    if (!klass || !A.class_get_methods || !A.method_get_name || !A.method_get_param_count) return nullptr;
-    void* iter = nullptr; void* m = nullptr;
-    while ((m = A.class_get_methods(klass, &iter)) != nullptr) {
-        if (A.method_get_param_count(m) == 3) {
-            // Premiere methode publique a 3 parametres trouvee sur PhotonView : dans ce dump
-            // il n'y en a qu'une avec cette forme (string, enum, object[]) -> RPC().
-            return m;
-        }
-    }
-    return nullptr;
-}
-
-static void* sget(void* field) {
-    if (!field) return nullptr;
-    void* v = nullptr;
-    A.field_static_get_value(field, &v);
-    return v;
-}
-
-static void* invoke(void* m, void* obj, void** args) {
-    if (!m) return nullptr;
-    void* exc = nullptr;
-    void* r = A.runtime_invoke(m, obj, args, &exc);
-    return exc ? nullptr : r;
+// Un pointeur "plausible" doit ressembler a une vraie adresse heap 64 bits : non nul et
+// dans une plage raisonnable. Ca evite de dereferencer n'importe quoi si le getter
+// renvoie une valeur qu'on n'attendait pas.
+static inline bool plausible(void* p) {
+    uintptr_t v = (uintptr_t)p;
+    return v > 0x1000 && v < 0x7fffffffffffULL;
 }
 
 static bool initCore() {
     if (g.ready) return true;
-    if (!loadAPI()) { g_status = "API il2cpp introuvable (manque : " + g_lastMissingSymbol + ")"; return false; }
-    g.domain = A.domain_get();
-    if (!g.domain) { g_status = "il2cpp pas encore lance"; return false; }
+    if (!loadAPI()) { g_status = "en attente : " + g_lastMissingSymbol; return false; }
 
-    void* asmAC  = A.domain_assembly_open(g.domain, "Assembly-CSharp");
-    void* asmPUN = A.domain_assembly_open(g.domain, "PhotonUnityNetworking");
-    if (!asmPUN) asmPUN = A.domain_assembly_open(g.domain, "Photon3Unity3D");
-    if (!asmAC) { g_status = "Assembly-CSharp introuvable"; return false; }
-    void* imgAC  = A.assembly_get_image(asmAC);
-    void* imgPUN = asmPUN ? A.assembly_get_image(asmPUN) : nullptr;
-    if (!imgAC) { g_status = "image introuvable"; return false; }
+    // Appel direct de Game.Instance via son adresse RVA. Pas d'API il2cpp, pas de
+    // recherche de classe : juste un pointeur de fonction calcule a la main.
+    fn_getGameInstance getInst = (fn_getGameInstance)(g_gbrBase + RVA_GAME_INSTANCE_GETTER);
+    void* game = getInst();
+    if (!plausible(game)) { g_status = "Game.Instance pas encore pret (relance au prochain essai)"; return false; }
 
-    g.cItem = A.class_from_name(imgAC, "", "Item");
-    g.cNP   = A.class_from_name(imgAC, "", "NetworkPlayer");
-    g.cGame = A.class_from_name(imgAC, "", "Game");
-    g.cPV   = imgPUN ? A.class_from_name(imgPUN, "", "PhotonView") : nullptr;
-    if (!g.cPV) g.cPV = A.class_from_name(imgAC, "", "PhotonView");   // parfois fusionne dans Assembly-CSharp
-    if (!g.cItem || !g.cNP || !g.cGame) { g_status = "classes du jeu introuvables (Item/NetworkPlayer/Game)"; return false; }
-
-    g.it_MaxAmmo = FO(g.cItem, "maxAmo");
-    g.it_CurAmmo = FO(g.cItem, "currAmo");
-    g.it_Damage  = FO(g.cItem, "itemDamage");
-    g.np_Items   = FO(g.cNP, "items");          // nom scramble -> probablement -1, voir repli plus bas
-    g.game_Players = FO(g.cGame, "players");    // idem
-
-    // Repli : si les noms scrambles empechent FO() de trouver le champ par nom, on retombe
-    // sur l'offset verifie manuellement (0x58 pour NetworkPlayer.items, 0x28 pour Game.players),
-    // confirme identique sur Android et sur ce dump iOS.
-    if (g.np_Items < 0) g.np_Items = 0x58;
-    if (g.game_Players < 0) g.game_Players = 0x28;
-
-    g.f_gameInst = FindSelfTypeStaticField(g.cGame, "Game");
-    g.m_rpcInvoke = g.cPV ? FindPhotonRPC(g.cPV) : nullptr;
-
+    g.f_gameInst = game;
     g.ready = true;
-    g_status = g.f_gameInst ? "connecte (Game trouve)" : "connecte (Game.Instance non resolu, a verifier en jeu)";
+    g_status = "connecte (appel direct par RVA, sans API il2cpp)";
     return true;
 }
 
 // Liste des NetworkPlayer de la partie en cours, via Game.Instance.players (List<NetworkPlayer>).
 static std::vector<void*> playerObjs() {
     std::vector<void*> out;
-    if (!g.ready || !g.f_gameInst) return out;
-    void* game = sget(g.f_gameInst);
-    if (!game) return out;
-    void* list = rd<void*>(game, g.game_Players);
-    if (!list) return out;
+    if (!g.ready || !plausible(g.f_gameInst)) return out;
+    void* list = rd<void*>(g.f_gameInst, g.game_Players);
+    if (!plausible(list)) return out;
     void* items = rd<void*>(list, 0x10);
     int32_t n = rd<int32_t>(list, 0x18);
-    if (!items || n <= 0 || n > 64) return out;
+    if (!plausible(items) || n <= 0 || n > 64) return out;
     for (int i = 0; i < n; i++) {
         void* np = rd<void*>(items, 0x20 + 8 * i);
-        if (np) out.push_back(np);
+        if (plausible(np)) out.push_back(np);
     }
     return out;
 }
@@ -293,22 +126,21 @@ static void coreTick() {
         if ((retry++ % 20) != 0) return;
         if (!initCore()) return;
     }
-    if (A.thread_attach) A.thread_attach(g.domain);
     if (!cfg.infiniteAmmo && !cfg.oneHitKill) return;
 
     for (void* np : playerObjs()) {
         void* itemsArr = rd<void*>(np, g.np_Items);
-        if (!itemsArr) continue;
+        if (!plausible(itemsArr)) continue;
         int32_t n = rd<int32_t>(itemsArr, 0x18);
         if (n <= 0 || n > 10) continue;
         for (int j = 0; j < n; j++) {
             void* item = rd<void*>(itemsArr, 0x20 + 8 * j);
-            if (!item) continue;
-            if (cfg.infiniteAmmo && g.it_MaxAmmo >= 0 && g.it_CurAmmo >= 0) {
+            if (!plausible(item)) continue;
+            if (cfg.infiniteAmmo) {
                 wr<int32_t>(item, g.it_MaxAmmo, 9999);
                 wr<int32_t>(item, g.it_CurAmmo, 9999);
             }
-            if (cfg.oneHitKill && g.it_Damage >= 0) {
+            if (cfg.oneHitKill) {
                 wr<int32_t>(item, g.it_Damage, 9999);
             }
         }
@@ -316,7 +148,6 @@ static void coreTick() {
 }
 
 // ============================= CORE END =============================
-
 #pragma mark - Helpers UI
 
 static UIColor* accent() { return [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1.0]; }
@@ -419,7 +250,7 @@ static UIWindow* gameWindow() {
     UILabel* title = [self label:@"Nyx Menu - GBR" size:18 bold:YES color:[UIColor whiteColor]];
     title.frame = CGRectMake(16, 12, 200, 24);
     [self.panel.contentView addSubview:title];
-    UILabel* sub = [self label:@"v2 - scan symboles Mach-O" size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.5]];
+    UILabel* sub = [self label:@"v3 - appel direct par RVA" size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.5]];
     sub.frame = CGRectMake(16, 36, 200, 14);
     [self.panel.contentView addSubview:sub];
 
