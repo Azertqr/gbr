@@ -56,11 +56,20 @@ static struct {
 } A;
 
 static bool g_apiLoaded = false;
+static std::string g_lastMissingSymbol;
 
 static bool loadAPI() {
     if (g_apiLoaded) return true;
+    // RTLD_DEFAULT ne cherche pas toujours correctement dans l'executable principal
+    // quand le moteur Unity est embarque directement dedans (pas de UnityFramework.framework
+    // separe, comme c'est le cas ici : tout est dans "gbr"). On demande explicitement le
+    // handle de l'executable principal en secours.
     void* h = RTLD_DEFAULT;
-#define NYX_LOAD(f) A.f = (fn_##f)dlsym(h, "il2cpp_" #f); if (!A.f) return false;
+    void* hMain = dlopen(nullptr, RTLD_NOW | RTLD_GLOBAL);
+#define NYX_LOAD(f) \
+    A.f = (fn_##f)dlsym(h, "il2cpp_" #f); \
+    if (!A.f && hMain) A.f = (fn_##f)dlsym(hMain, "il2cpp_" #f); \
+    if (!A.f) { g_lastMissingSymbol = "il2cpp_" #f; return false; }
     NYX_LOAD(domain_get)
     NYX_LOAD(domain_assembly_open)
     NYX_LOAD(assembly_get_image)
@@ -159,7 +168,7 @@ static void* invoke(void* m, void* obj, void** args) {
 
 static bool initCore() {
     if (g.ready) return true;
-    if (!loadAPI()) { g_status = "API il2cpp introuvable"; return false; }
+    if (!loadAPI()) { g_status = "API il2cpp introuvable (manque : " + g_lastMissingSymbol + ")"; return false; }
     g.domain = A.domain_get();
     if (!g.domain) { g_status = "il2cpp pas encore lance"; return false; }
 
