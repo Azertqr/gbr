@@ -419,7 +419,7 @@ static UIWindow* gameWindow() {
     UILabel* title = [self label:@"Nyx Menu - GBR" size:18 bold:YES color:[UIColor whiteColor]];
     title.frame = CGRectMake(16, 12, 200, 24);
     [self.panel.contentView addSubview:title];
-    UILabel* sub = [self label:@"v1 - socle verifie" size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.5]];
+    UILabel* sub = [self label:@"v2 - scan symboles Mach-O" size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.5]];
     sub.frame = CGRectMake(16, 36, 200, 14);
     [self.panel.contentView addSubview:sub];
 
