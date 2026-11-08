@@ -38,6 +38,12 @@ static std::string g_lastMissingSymbol;
 // RVA retrouvees dans dump_1.cs pour Grand Battle Royale 3.5.2.
 // A revoir si le jeu est mis a jour (refaire le dump, rechercher la meme methode).
 static const uintptr_t RVA_GAME_INSTANCE_GETTER = 0x19138DC;
+static const uintptr_t RVA_REVIVE_AS_HUMAN       = 0x1BF1F60;   // NetworkPlayer.ReviveAsHuman()
+static const uintptr_t RVA_REVIVE_AS_ZOMBIE      = 0x1BE8C00;   // NetworkPlayer.ReviveAsZombie()
+static const uintptr_t RVA_ASSIGN_SKIN           = 0x1BDEE34;   // NetworkPlayer.AssignSkinFromZombiesDatabase(int)
+
+typedef void (*fn_void0)(void* self);
+typedef void (*fn_void1_int)(void* self, int32_t a);
 
 static uintptr_t FindImageBase(const char* needle) {
     uint32_t n = _dyld_image_count();
@@ -60,6 +66,8 @@ static bool loadAPI() {
 struct Cfg {
     bool infiniteAmmo = false;
     bool oneHitKill = false;
+    bool speed = false;
+    float speedMul = 2.0f;
 };
 static Cfg cfg;
 
@@ -75,6 +83,11 @@ static struct {
     int it_MaxAmmo   = 0x44;   // Item.maxAmo
     int it_CurAmmo   = 0x48;   // Item.currAmo
     int it_Damage    = 0x50;   // Item.itemDamage
+    int np_IsLocal   = 0x2E8;  // NetworkPlayer.isLocal (bool)
+    int np_MoveCtrl  = 0x2D8;  // NetworkPlayer.MoveController
+    int mc_WalkSpeed   = 0x1C; // MoveController.m_WalkSpeed
+    int mc_RunSpeed    = 0x20; // MoveController.m_RunSpeed
+    int mc_SprintSpeed = 0x24; // MoveController.m_SprintSpeed
 } g;
 
 template <typename T> static inline T rd(void* o, int off) { return *(T*)((uint8_t*)o + off); }
@@ -120,12 +133,76 @@ static std::vector<void*> playerObjs() {
     return out;
 }
 
+// Le joueur local (nous) dans la liste Game.Instance.players : celui dont isLocal == true.
+static void* getLocalPlayer() {
+    for (void* np : playerObjs()) {
+        if (rd<uint8_t>(np, g.np_IsLocal) != 0) return np;
+    }
+    return nullptr;
+}
+
+// Actions directes : appels de methode locaux (sur notre propre joueur uniquement).
+// Ca marche de facon fiable puisque c'est notre propre objet, qu'on possede sur le
+// reseau. Contrairement a un kill a distance, pas besoin de passer par le systeme RPC
+// de Photon (qui demanderait de reconstruire un object[] a la main sans l'API il2cpp).
+static int reviveAsHuman() {
+    void* lp = getLocalPlayer();
+    if (!plausible(lp)) return -1;
+    ((fn_void0)(g_gbrBase + RVA_REVIVE_AS_HUMAN))(lp);
+    return 0;
+}
+static int reviveAsZombie() {
+    void* lp = getLocalPlayer();
+    if (!plausible(lp)) return -1;
+    ((fn_void0)(g_gbrBase + RVA_REVIVE_AS_ZOMBIE))(lp);
+    return 0;
+}
+static int nextSkin() {
+    static int32_t skinId = 0;
+    void* lp = getLocalPlayer();
+    if (!plausible(lp)) return -1;
+    skinId = (skinId + 1) % 10;
+    ((fn_void1_int)(g_gbrBase + RVA_ASSIGN_SKIN))(lp, skinId);
+    return skinId;
+}
+
 static void coreTick() {
     static int retry = 0;
     if (!g.ready) {
         if ((retry++ % 20) != 0) return;
         if (!initCore()) return;
     }
+    // --- Vitesse (joueur local uniquement) ----------------------------------
+    static void* lastLocal = nullptr;
+    static float baseWalk = 0, baseRun = 0, baseSprint = 0;
+    static bool speedApplied = false;
+    void* lp = getLocalPlayer();
+    if (plausible(lp)) {
+        void* mc = rd<void*>(lp, g.np_MoveCtrl);
+        if (plausible(mc)) {
+            if (mc != lastLocal) {
+                lastLocal = mc; speedApplied = false;
+                baseWalk = rd<float>(mc, g.mc_WalkSpeed);
+                baseRun = rd<float>(mc, g.mc_RunSpeed);
+                baseSprint = rd<float>(mc, g.mc_SprintSpeed);
+                if (baseWalk <= 0.f || baseWalk > 50.f) baseWalk = 5.f;
+                if (baseRun <= 0.f || baseRun > 50.f) baseRun = 8.f;
+                if (baseSprint <= 0.f || baseSprint > 50.f) baseSprint = 12.f;
+            }
+            if (cfg.speed) {
+                wr<float>(mc, g.mc_WalkSpeed, baseWalk * cfg.speedMul);
+                wr<float>(mc, g.mc_RunSpeed, baseRun * cfg.speedMul);
+                wr<float>(mc, g.mc_SprintSpeed, baseSprint * cfg.speedMul);
+                speedApplied = true;
+            } else if (speedApplied) {
+                wr<float>(mc, g.mc_WalkSpeed, baseWalk);
+                wr<float>(mc, g.mc_RunSpeed, baseRun);
+                wr<float>(mc, g.mc_SprintSpeed, baseSprint);
+                speedApplied = false;
+            }
+        }
+    }
+
     if (!cfg.infiniteAmmo && !cfg.oneHitKill) return;
 
     for (void* np : playerObjs()) {
@@ -179,6 +256,9 @@ static UIWindow* gameWindow() {
 @property (nonatomic, strong) UIButton* fab;
 @property (nonatomic, strong) UIVisualEffectView* panel;
 @property (nonatomic, strong) UILabel* statusLabel;
+@property (nonatomic, strong) UILabel* speedLabel;
+@property (nonatomic, copy) NSString* msg;
+@property (nonatomic, assign) CFAbsoluteTime msgTime;
 + (instancetype)shared;
 - (void)attach:(UIWindow*)w;
 - (void)refresh;
@@ -214,6 +294,31 @@ static UIWindow* gameWindow() {
     return y + 40;
 }
 
+- (UIButton*)button:(NSString*)t sel:(SEL)sel frame:(CGRect)f in:(UIScrollView*)sv {
+    UIButton* b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = f;
+    b.backgroundColor = [UIColor colorWithRed:0.25 green:0.14 blue:0.04 alpha:0.95];
+    b.layer.borderWidth = 1.0;
+    b.layer.borderColor = accent().CGColor;
+    b.layer.cornerRadius = 9;
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    b.titleLabel.adjustsFontSizeToFitWidth = YES;
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [b addTarget:self action:sel forControlEvents:UIControlEventTouchUpInside];
+    [sv addSubview:b];
+    return b;
+}
+
+- (UISlider*)slider:(NSInteger)tag min:(float)mn max:(float)mx val:(float)v y:(CGFloat)y in:(UIScrollView*)sv {
+    UISlider* sl = [[UISlider alloc] initWithFrame:CGRectMake(16, y, 268, 28)];
+    sl.tag = tag; sl.minimumValue = mn; sl.maximumValue = mx; sl.value = v;
+    sl.minimumTrackTintColor = accent();
+    [sl addTarget:self action:@selector(slide:) forControlEvents:UIControlEventValueChanged];
+    [sv addSubview:sl];
+    return sl;
+}
+
 - (void)attach:(UIWindow*)w {
     self.host = w;
     CGFloat s = 46;
@@ -237,7 +342,7 @@ static UIWindow* gameWindow() {
 }
 
 - (void)buildPanel {
-    CGFloat W = 300, H = 220;
+    CGFloat W = 300, H = 400;
     UIBlurEffect* blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
     self.panel = [[UIVisualEffectView alloc] initWithEffect:blur];
     self.panel.frame = CGRectMake(0, 0, W, H);
@@ -268,13 +373,26 @@ static UIWindow* gameWindow() {
     CGFloat y = 10;
     y = [self toggle:@"Munitions infinies" tag:0 y:y in:sv];
     y = [self toggle:@"One Hit Kill" tag:1 y:y in:sv];
+    y = [self toggle:@"Vitesse" tag:2 y:y in:sv];
+    self.speedLabel = [self label:[NSString stringWithFormat:@"Multiplicateur : x%.1f", cfg.speedMul]
+                             size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.65]];
+    self.speedLabel.frame = CGRectMake(16, y, 260, 14);
+    [sv addSubview:self.speedLabel];
+    [self slider:100 min:1.0 max:5.0 val:cfg.speedMul y:y + 16 in:sv];
+    y += 48;
+
+    [self button:@"Reviv humain" sel:@selector(reviveHumanTap) frame:CGRectMake(16, y, 130, 36) in:sv];
+    [self button:@"Reviv zombie" sel:@selector(reviveZombieTap) frame:CGRectMake(154, y, 130, 36) in:sv];
+    y += 44;
+    [self button:@"Skin suivant" sel:@selector(skinTap) frame:CGRectMake(16, y, W - 32, 36) in:sv];
+    y += 44;
 
     self.statusLabel = [self label:@"" size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.5]];
     self.statusLabel.numberOfLines = 3;
     self.statusLabel.frame = CGRectMake(16, y + 10, W - 32, 50);
     [sv addSubview:self.statusLabel];
 
-    sv.contentSize = CGSizeMake(W, y + 60);
+    sv.contentSize = CGSizeMake(W, y + 70);
     [self.host addSubview:self.panel];
 }
 
@@ -307,13 +425,42 @@ static UIWindow* gameWindow() {
     bool v = s.on;
     if (s.tag == 0) cfg.infiniteAmmo = v;
     if (s.tag == 1) cfg.oneHitKill = v;
+    if (s.tag == 2) cfg.speed = v;
     haptic();
+}
+
+- (void)slide:(UISlider*)s {
+    cfg.speedMul = roundf(s.value * 10.f) / 10.f;
+    self.speedLabel.text = [NSString stringWithFormat:@"Multiplicateur : x%.1f", cfg.speedMul];
+}
+
+- (void)say:(NSString*)m {
+    self.msg = m;
+    self.msgTime = CFAbsoluteTimeGetCurrent();
+}
+
+- (void)reviveHumanTap {
+    haptic();
+    [self say:reviveAsHuman() == 0 ? @"Reviv humain envoye" : @"Impossible : pas en partie"];
+}
+- (void)reviveZombieTap {
+    haptic();
+    [self say:reviveAsZombie() == 0 ? @"Reviv zombie envoye" : @"Impossible : pas en partie"];
+}
+- (void)skinTap {
+    haptic();
+    int r = nextSkin();
+    [self say:r >= 0 ? [NSString stringWithFormat:@"Skin %d envoye", r] : @"Impossible : pas en partie"];
 }
 
 - (void)refresh {
     if (self.panel.hidden) return;
-    std::string st = g_status;
-    self.statusLabel.text = [NSString stringWithFormat:@"%s", st.c_str()];
+    if (self.msg && (CFAbsoluteTimeGetCurrent() - self.msgTime) < 4.0) {
+        self.statusLabel.text = self.msg;
+    } else {
+        std::string st = g_status;
+        self.statusLabel.text = [NSString stringWithFormat:@"%s", st.c_str()];
+    }
 }
 
 - (void)keepOnTop {
