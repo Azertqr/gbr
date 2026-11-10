@@ -20,6 +20,8 @@
 #include <string>
 #include <vector>
 #include <mach-o/dyld.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 // ============================ CORE BEGIN ============================
 
@@ -41,6 +43,63 @@ static const uintptr_t RVA_GAME_INSTANCE_GETTER = 0x19138DC;
 static const uintptr_t RVA_REVIVE_AS_HUMAN       = 0x1BF1F60;   // NetworkPlayer.ReviveAsHuman()
 static const uintptr_t RVA_REVIVE_AS_ZOMBIE      = 0x1BE8C00;   // NetworkPlayer.ReviveAsZombie()
 static const uintptr_t RVA_ASSIGN_SKIN           = 0x1BDEE34;   // NetworkPlayer.AssignSkinFromZombiesDatabase(int)
+static const uintptr_t RVA_RECEIVE_DAMAGE        = 0x1BE1950;   // NetworkPlayer.ReceiveDamage(float, int, ItemType, int, Vector3)
+
+struct Vec3f { float x, y, z; };
+typedef void (*fn_receiveDamage)(void* self, float damage, int32_t attackerId, int32_t itemType, int32_t unk, Vec3f pos);
+
+// ---- Anti-Cheat Toolkit (asset tiers, classes non obfusquees, memes noms que sur Android) ----
+// On patche le debut de chaque fonction avec l'instruction ARM64 "ret" (retour immediat,
+// la fonction ne fait plus rien). Sauvegarde des octets d'origine pour pouvoir annuler.
+static const uintptr_t RVA_AC[] = {
+    0x1725144,   // ObscuredCheatingDetector.Awake
+    0x172BD98,   // SpeedHackDetector.Awake
+    0x172B998,   // SpeedHackDetector.Update
+    0x1734758,   // TimeCheatingDetector.Awake
+    0x173CDAC,   // WallHackDetector.Awake
+    0x173E0C4,   // WallHackDetector.FixedUpdate
+    0x173F024,   // WallHackDetector.Update
+    0x172230C,   // ActDetectorBase.Start (base commune, couvre aussi InjectionDetector)
+    0x1722414,   // ActDetectorBase.OnEnable
+    0x1991DBC,   // Game.<naughtyReason coroutine>.MoveNext() — retrouvee en comparant
+                 // le dump Android 3.5.1 (RVA 0xB7B654, meme nom de classe scramble
+                 // "Game.؃׽׹؂׾؃׽׷׶؁׾") avec le dump iOS 3.5.2 : noms identiques des
+                 // deux cotes, meme obfuscateur / meme seed.
+    0x1908DC0,   // Game.NaughtyToolkitCallback() — nom en clair des deux cotes
+};
+static const int RVA_AC_COUNT = sizeof(RVA_AC) / sizeof(RVA_AC[0]);
+static uint32_t g_acOriginal[RVA_AC_COUNT];
+static bool g_acPatched[RVA_AC_COUNT] = {false};
+static bool g_acAttempted = false;
+
+static bool PatchBytes(uintptr_t addr, uint32_t newInstr, uint32_t* outOriginal) {
+    long pagesize = sysconf(_SC_PAGESIZE);
+    uintptr_t pageStart = addr & ~(uintptr_t)(pagesize - 1);
+    if (mprotect((void*)pageStart, pagesize, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
+    *outOriginal = *(uint32_t*)addr;
+    *(uint32_t*)addr = newInstr;
+    mprotect((void*)pageStart, pagesize, PROT_READ | PROT_EXEC);   // remet en lecture seule + execution
+    return true;
+}
+
+static void ApplyAntiCheatBypass(bool on) {
+    g_acAttempted = true;
+    const uint32_t RET_ARM64 = 0xD65F03C0;   // instruction "ret" en ARM64
+    for (int i = 0; i < RVA_AC_COUNT; i++) {
+        uintptr_t addr = g_gbrBase + RVA_AC[i];
+        if (on && !g_acPatched[i]) {
+            g_acPatched[i] = PatchBytes(addr, RET_ARM64, &g_acOriginal[i]);
+        } else if (!on && g_acPatched[i]) {
+            long pagesize = sysconf(_SC_PAGESIZE);
+            uintptr_t pageStart = addr & ~(uintptr_t)(pagesize - 1);
+            if (mprotect((void*)pageStart, pagesize, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
+                *(uint32_t*)addr = g_acOriginal[i];
+                mprotect((void*)pageStart, pagesize, PROT_READ | PROT_EXEC);
+            }
+            g_acPatched[i] = false;
+        }
+    }
+}
 
 typedef void (*fn_void0)(void* self);
 typedef void (*fn_void1_int)(void* self, int32_t a);
@@ -68,6 +127,8 @@ struct Cfg {
     bool oneHitKill = false;
     bool speed = false;
     float speedMul = 2.0f;
+    bool infiniteHealth = false;
+    bool antiCheatBypass = false;
 };
 static Cfg cfg;
 
@@ -172,6 +233,24 @@ static void coreTick() {
         if ((retry++ % 20) != 0) return;
         if (!initCore()) return;
     }
+    // --- Anti-Cheat Bypass (patch une seule fois a l'activation, pas a chaque tick) ---
+    static bool lastAcState = false;
+    if (cfg.antiCheatBypass != lastAcState) {
+        ApplyAntiCheatBypass(cfg.antiCheatBypass);
+        lastAcState = cfg.antiCheatBypass;
+    }
+
+    // --- Vie infinie : on "soigne" en rappelant ReceiveDamage avec des degats negatifs ---
+    // (pas de champ sante identifiable dans le dump ; cette methode est confirmee et deja
+    // utilisee pour munitions/degats, donc plus sure qu'un offset devine au hasard)
+    static int healTick = 0;
+    if (cfg.infiniteHealth && plausible(getLocalPlayer()) && (healTick++ % 10) == 0) {
+        void* me = getLocalPlayer();
+        Vec3f pos = rd<Vec3f>(me, 0x184);
+        int32_t myActor = rd<int32_t>(me, 0x2EC);
+        ((fn_receiveDamage)(g_gbrBase + RVA_RECEIVE_DAMAGE))(me, -9999.f, myActor, 0, 0, pos);
+    }
+
     // --- Vitesse (joueur local uniquement) ----------------------------------
     static void* lastLocal = nullptr;
     static float baseWalk = 0, baseRun = 0, baseSprint = 0;
@@ -342,7 +421,7 @@ static UIWindow* gameWindow() {
 }
 
 - (void)buildPanel {
-    CGFloat W = 300, H = 400;
+    CGFloat W = 300, H = 480;
     UIBlurEffect* blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
     self.panel = [[UIVisualEffectView alloc] initWithEffect:blur];
     self.panel.frame = CGRectMake(0, 0, W, H);
@@ -374,6 +453,8 @@ static UIWindow* gameWindow() {
     y = [self toggle:@"Munitions infinies" tag:0 y:y in:sv];
     y = [self toggle:@"One Hit Kill" tag:1 y:y in:sv];
     y = [self toggle:@"Vitesse" tag:2 y:y in:sv];
+    y = [self toggle:@"Vie infinie (soin en boucle)" tag:3 y:y in:sv];
+    y = [self toggle:@"Anti-Cheat Bypass" tag:4 y:y in:sv];
     self.speedLabel = [self label:[NSString stringWithFormat:@"Multiplicateur : x%.1f", cfg.speedMul]
                              size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.65]];
     self.speedLabel.frame = CGRectMake(16, y, 260, 14);
@@ -426,6 +507,8 @@ static UIWindow* gameWindow() {
     if (s.tag == 0) cfg.infiniteAmmo = v;
     if (s.tag == 1) cfg.oneHitKill = v;
     if (s.tag == 2) cfg.speed = v;
+    if (s.tag == 3) cfg.infiniteHealth = v;
+    if (s.tag == 4) cfg.antiCheatBypass = v;
     haptic();
 }
 
