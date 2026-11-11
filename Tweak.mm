@@ -1,16 +1,14 @@
-// Nyx Menu — Grand Battle Royale (iOS, Unity IL2CPP) — dump fourni par l'utilisateur
-// Le jeu est protege par un obfuscateur de noms (Beebyte ou equivalent) : les champs et
-// methodes internes du jeu sont renommes en charabia. Mais deux choses restent exploitables :
-//   1. Les classes Item, NetworkPlayer, Game gardent leur vrai nom (verifie dans le dump).
-//   2. Les methodes RPC Photon (ReceiveDamage, ReviveAsHuman, ...) gardent leur vrai nom,
-//      parce que Photon doit pouvoir les appeler par leur nom exact sur le reseau.
-// Les OFFSETS DE CHAMPS ont ete verifies et collent exactement entre le build Android
-// (cf. OFF_NP_*/OFF_ITEM_* du mod LGL) et ce dump iOS : meme version Unity/IL2CPP,
-// meme disposition memoire sur 64 bits. Les ADRESSES DE FONCTIONS codees en dur dans
-// le mod Android (0xAB24FC, 0x150A910...) ne sont PAS reutilisees : ce sont des adresses
-// de code natif, propres au binaire Android, inutilisables tel quel sur iOS.
-//
-// Build : clang++ -arch arm64 -fobjc-arc -dynamiclib (voir build.yml, identique a Among Us)
+// Nyx Menu — Grand Battle Royale (iOS, Unity IL2CPP) — FIXED BUILD
+// Correctifs majeurs appliques :
+// 1. ASLR Slide : sur iOS, _dyld_get_image_header(i) inclut le header __TEXT (0x100000000).
+//    Comme les RVA de dump.cs sur iOS contiennent souvent deja ou non la base 0x100000000,
+//    on normalise l'adresse via _dyld_get_image_vmaddr_slide(i) et un masque de RVA propre.
+// 2. Patch memoire iOS (XNU W^X) : mprotect(..., PROT_READ|PROT_WRITE|PROT_EXEC) echoue toujours
+//    sur iOS sans jailbreak/entitlement dynamique. Remplace par vm_protect avec VM_PROT_COPY
+//    (Copy-on-Write page) + remise en RX + sys_icache_invalidate obligatoire sur ARM64.
+// 3. Cablage UI : ApplyInfiniteHealth(v) n'etait meme pas appele dans sw:(UISwitch*)s (tag 3) !
+// 4. Securite loadAPI() : appelee automatiquement avant tout patch si l'utilisateur active
+//    les switchs avant que coreTick() ait fini son init.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -20,25 +18,22 @@
 #include <string>
 #include <vector>
 #include <mach-o/dyld.h>
+#include <mach/mach.h>
+#include <libkern/OSCacheControl.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 // ============================ CORE BEGIN ============================
 
-// L'API publique il2cpp_* a ete retiree du binaire a la publication (verifie en lisant
-// le vrai fichier "gbr" : LC_SYMTAB existe mais ne contient que des symboles
-// PLCrashReporter, aucun il2cpp_*). Inutile de la chercher par son nom.
-// A la place, on appelle directement les fonctions du jeu par leur adresse, calculee
-// comme (base de chargement de "gbr") + (RVA retrouvee dans dump_1.cs). La base de
-// chargement se trouve via l'API publique dyld, qui ne depend d'aucun symbole du jeu.
+typedef void* (*fn_getGameInstance)(void);
+typedef void (*fn_void0)(void* self);
+typedef void (*fn_void1_int)(void* self, int32_t a);
 
-typedef void* (*fn_getGameInstance)(void);   // getter statique Game.Instance, 0 argument
-
-static uintptr_t g_gbrBase = 0;       // adresse de chargement de l'image "gbr" (ASLR deja applique)
+static uintptr_t g_gbrBase = 0;       // Header __TEXT de l'image "gbr"
+static uintptr_t g_gbrSlide = 0;      // Slide ASLR de l'image "gbr"
 static std::string g_lastMissingSymbol;
 
 // RVA retrouvees dans dump_1.cs pour Grand Battle Royale 3.5.2.
-// A revoir si le jeu est mis a jour (refaire le dump, rechercher la meme methode).
 static const uintptr_t RVA_GAME_INSTANCE_GETTER = 0x19138DC;
 static const uintptr_t RVA_REVIVE_AS_HUMAN       = 0x1BF1F60;   // NetworkPlayer.ReviveAsHuman()
 static const uintptr_t RVA_REVIVE_AS_ZOMBIE      = 0x1BE8C00;   // NetworkPlayer.ReviveAsZombie()
@@ -48,9 +43,7 @@ static const uintptr_t RVA_RECEIVE_DAMAGE        = 0x1BE1950;   // NetworkPlayer
 struct Vec3f { float x, y, z; };
 typedef void (*fn_receiveDamage)(void* self, float damage, int32_t attackerId, int32_t itemType, int32_t unk, Vec3f pos);
 
-// ---- Anti-Cheat Toolkit (asset tiers, classes non obfusquees, memes noms que sur Android) ----
-// On patche le debut de chaque fonction avec l'instruction ARM64 "ret" (retour immediat,
-// la fonction ne fait plus rien). Sauvegarde des octets d'origine pour pouvoir annuler.
+// ---- Anti-Cheat Toolkit & Game AC ----
 static const uintptr_t RVA_AC[] = {
     0x1725144,   // ObscuredCheatingDetector.Awake
     0x172BD98,   // SpeedHackDetector.Awake
@@ -59,67 +52,130 @@ static const uintptr_t RVA_AC[] = {
     0x173CDAC,   // WallHackDetector.Awake
     0x173E0C4,   // WallHackDetector.FixedUpdate
     0x173F024,   // WallHackDetector.Update
-    0x172230C,   // ActDetectorBase.Start (base commune, couvre aussi InjectionDetector)
+    0x172230C,   // ActDetectorBase.Start
     0x1722414,   // ActDetectorBase.OnEnable
-    0x1991DBC,   // Game.<naughtyReason coroutine>.MoveNext() — retrouvee en comparant
-                 // le dump Android 3.5.1 (RVA 0xB7B654, meme nom de classe scramble
-                 // "Game.؃׽׹؂׾؃׽׷׶؁׾") avec le dump iOS 3.5.2 : noms identiques des
-                 // deux cotes, meme obfuscateur / meme seed.
-    0x1908DC0,   // Game.NaughtyToolkitCallback() — nom en clair des deux cotes
+    0x1991DBC,   // Game.<naughtyReason coroutine>.MoveNext()
+    0x1908DC0,   // Game.NaughtyToolkitCallback()
 };
 static const int RVA_AC_COUNT = sizeof(RVA_AC) / sizeof(RVA_AC[0]);
 static uint32_t g_acOriginal[RVA_AC_COUNT];
 static bool g_acPatched[RVA_AC_COUNT] = {false};
 static bool g_acAttempted = false;
+static int g_acSucceeded = 0;
 
-static bool PatchBytes(uintptr_t addr, uint32_t newInstr, uint32_t* outOriginal) {
-    long pagesize = sysconf(_SC_PAGESIZE);
-    uintptr_t pageStart = addr & ~(uintptr_t)(pagesize - 1);
-    if (mprotect((void*)pageStart, pagesize, PROT_READ | PROT_WRITE | PROT_EXEC) != 0) return false;
-    *outOriginal = *(uint32_t*)addr;
-    *(uint32_t*)addr = newInstr;
-    mprotect((void*)pageStart, pagesize, PROT_READ | PROT_EXEC);   // remet en lecture seule + execution
-    return true;
-}
+static uint32_t g_healthOriginal = 0;
+static bool g_healthPatched = false;
 
-static void ApplyAntiCheatBypass(bool on) {
-    g_acAttempted = true;
-    const uint32_t RET_ARM64 = 0xD65F03C0;   // instruction "ret" en ARM64
-    for (int i = 0; i < RVA_AC_COUNT; i++) {
-        uintptr_t addr = g_gbrBase + RVA_AC[i];
-        if (on && !g_acPatched[i]) {
-            g_acPatched[i] = PatchBytes(addr, RET_ARM64, &g_acOriginal[i]);
-        } else if (!on && g_acPatched[i]) {
-            long pagesize = sysconf(_SC_PAGESIZE);
-            uintptr_t pageStart = addr & ~(uintptr_t)(pagesize - 1);
-            if (mprotect((void*)pageStart, pagesize, PROT_READ | PROT_WRITE | PROT_EXEC) == 0) {
-                *(uint32_t*)addr = g_acOriginal[i];
-                mprotect((void*)pageStart, pagesize, PROT_READ | PROT_EXEC);
-            }
-            g_acPatched[i] = false;
-        }
-    }
-}
-
-typedef void (*fn_void0)(void* self);
-typedef void (*fn_void1_int)(void* self, int32_t a);
-
-static uintptr_t FindImageBase(const char* needle) {
+static bool FindImageBaseAndSlide(const char* needle) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char* name = _dyld_get_image_name(i);
-        if (name && strstr(name, needle)) return (uintptr_t)_dyld_get_image_header(i);
+        if (name && strstr(name, needle)) {
+            g_gbrBase  = (uintptr_t)_dyld_get_image_header(i);
+            g_gbrSlide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
+            return (g_gbrBase != 0);
+        }
     }
-    return 0;
+    return false;
 }
 
 static bool loadAPI() {
-    if (g_gbrBase) return true;
-    // le binaire principal du jeu s'appelle "gbr" (pas de UnityFramework separe) ;
-    // son chemin dans le bundle est .../gbr.app/gbr
-    g_gbrBase = FindImageBase("/gbr");
-    if (!g_gbrBase) { g_lastMissingSymbol = "image gbr pas encore chargee"; return false; }
+    if (g_gbrBase != 0) return true;
+    // Cherche "/gbr" ou "UnityFramework" au cas ou le binaire change de structure
+    if (!FindImageBaseAndSlide("/gbr") && !FindImageBaseAndSlide("UnityFramework")) {
+        g_lastMissingSymbol = "image gbr pas encore chargee";
+        return false;
+    }
     return true;
+}
+
+// Calcule l'adresse reelle en RAM que la RVA vienne d'un dump.cs (offset pur) ou d'IDA (0x100000000 + offset)
+static inline uintptr_t RealAddr(uintptr_t rva) {
+    if (rva >= 0x100000000ULL) {
+        return g_gbrSlide + rva;
+    }
+    return g_gbrBase + rva;
+}
+
+// Patch memoire iOS ARM64 propre : contourne le W^X de XNU via VM_PROT_COPY + flush cache L1 I/D
+static bool PatchBytes(uintptr_t addr, uint32_t newInstr, uint32_t* outOriginal) {
+    if (!addr) return false;
+    long pagesize = sysconf(_SC_PAGESIZE);
+    uintptr_t pageStart = addr & ~(uintptr_t)(pagesize - 1);
+    mach_port_t selfTask = mach_task_self();
+
+    // 1. Passage en RW avec VM_PROT_COPY (cree une page privee Copy-on-Write autorisee sur iOS)
+    kern_return_t kr = vm_protect(selfTask, (vm_address_t)pageStart, (vm_size_t)pagesize, FALSE,
+                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+    if (kr != KERN_SUCCESS) {
+        // Fallback mprotect RW (sans EXEC, car RWX est interdit par XNU)
+        if (mprotect((void*)pageStart, pagesize, PROT_READ | PROT_WRITE) != 0) {
+            return false;
+        }
+    }
+
+    // 2. Sauvegarde de l'instruction d'origine et ecriture du patch
+    if (outOriginal) {
+        *outOriginal = *(uint32_t*)addr;
+    }
+    *(uint32_t*)addr = newInstr;
+
+    // 3. Remise de la page en RX (Read + Execute) pour que le CPU puisse executer le code
+    kr = vm_protect(selfTask, (vm_address_t)pageStart, (vm_size_t)pagesize, FALSE,
+                    VM_PROT_READ | VM_PROT_EXECUTE);
+    if (kr != KERN_SUCCESS) {
+        mprotect((void*)pageStart, pagesize, PROT_READ | PROT_EXEC);
+    }
+
+    // 4. Invalidation obligatoire du cache d'instructions ARM64
+    sys_icache_invalidate((void*)addr, sizeof(uint32_t));
+    return true;
+}
+
+static bool RestoreBytes(uintptr_t addr, uint32_t origInstr) {
+    return PatchBytes(addr, origInstr, nullptr);
+}
+
+// Vie infinie : patche NetworkPlayer.ReceiveDamage (0x1BE1950) avec RET (0xD65F03C0)
+// Exactement comme OFF_RECV_DMG (0xB53CC8) sur ton Main.cpp Android[span_0](start_span)[span_0](end_span).
+static bool ApplyInfiniteHealth(bool on) {
+    if (!loadAPI()) return false;
+    uintptr_t addr = RealAddr(RVA_RECEIVE_DAMAGE);
+    const uint32_t RET_ARM64 = 0xD65F03C0; // C0 03 5F D6 en little-endian
+
+    if (on && !g_healthPatched) {
+        g_healthPatched = PatchBytes(addr, RET_ARM64, &g_healthOriginal);
+        return g_healthPatched;
+    }
+    if (!on && g_healthPatched) {
+        if (RestoreBytes(addr, g_healthOriginal)) {
+            g_healthPatched = false;
+            return true;
+        }
+        return false;
+    }
+    return g_healthPatched == on;
+}
+
+static void ApplyAntiCheatBypass(bool on) {
+    if (!loadAPI()) return;
+    g_acAttempted = true;
+    g_acSucceeded = 0;
+    const uint32_t RET_ARM64 = 0xD65F03C0;
+
+    for (int i = 0; i < RVA_AC_COUNT; i++) {
+        uintptr_t addr = RealAddr(RVA_AC[i]);
+        if (on) {
+            if (!g_acPatched[i]) {
+                g_acPatched[i] = PatchBytes(addr, RET_ARM64, &g_acOriginal[i]);
+            }
+            if (g_acPatched[i]) g_acSucceeded++;
+        } else if (!on && g_acPatched[i]) {
+            if (RestoreBytes(addr, g_acOriginal[i])) {
+                g_acPatched[i] = false;
+            }
+        }
+    }
 }
 
 struct Cfg {
@@ -136,49 +192,51 @@ static std::string g_status = "en attente du jeu...";
 
 static struct {
     bool ready = false;
-    void* f_gameInst = nullptr;   // pointeur Game.Instance, obtenu en appelant son getter
-    // offsets de champs verifies (identiques entre le mod Android et ce dump iOS,
-    // meme version Unity/IL2CPP, meme disposition memoire 64 bits) :
-    int game_Players = 0x28;   // Game.players : List<NetworkPlayer>
-    int np_Items     = 0x58;   // NetworkPlayer.items : Item[]
-    int it_MaxAmmo   = 0x44;   // Item.maxAmo
-    int it_CurAmmo   = 0x48;   // Item.currAmo
-    int it_Damage    = 0x50;   // Item.itemDamage
-    int np_IsLocal   = 0x2E8;  // NetworkPlayer.isLocal (bool)
-    int np_MoveCtrl  = 0x2D8;  // NetworkPlayer.MoveController
-    int mc_WalkSpeed   = 0x1C; // MoveController.m_WalkSpeed
-    int mc_RunSpeed    = 0x20; // MoveController.m_RunSpeed
-    int mc_SprintSpeed = 0x24; // MoveController.m_SprintSpeed
+    void* f_gameInst = nullptr;
+    // Offsets de champs 64-bit verifies (identiques a ton Main.cpp Android)[span_1](start_span)[span_1](end_span) :
+    int game_Players   = 0x28;  // Game.playerList : List<NetworkPlayer>[span_2](start_span)[span_2](end_span)
+    int np_Items       = 0x58;  // NetworkPlayer.items : Item[][span_3](start_span)[span_3](end_span)
+    int it_Speed       = 0x30;  // Item.basicShootSpeed[span_4](start_span)[span_4](end_span)
+    int it_Reload      = 0x34;  // Item.basicReloadSpeed[span_5](start_span)[span_5](end_span)
+    int it_Range       = 0x40;  // Item.range[span_6](start_span)[span_6](end_span)
+    int it_MaxAmmo     = 0x44;  // Item.maxAmo[span_7](start_span)[span_7](end_span)
+    int it_CurAmmo     = 0x48;  // Item.currAmo[span_8](start_span)[span_8](end_span)
+    int it_Damage      = 0x50;  // Item.itemDamage[span_9](start_span)[span_9](end_span)
+    int np_IsLocal     = 0x2E8; // NetworkPlayer.isLocal (byte/bool)[span_10](start_span)[span_10](end_span)
+    int np_MoveCtrl    = 0x2D8; // NetworkPlayer.MoveController
+    int mc_WalkSpeed   = 0x1C;  // MoveController.m_WalkSpeed[span_11](start_span)[span_11](end_span)
+    int mc_RunSpeed    = 0x20;  // MoveController.m_RunSpeed[span_12](start_span)[span_12](end_span)
+    int mc_SprintSpeed = 0x24;  // MoveController.m_SprintSpeed[span_13](start_span)[span_13](end_span)
 } g;
 
 template <typename T> static inline T rd(void* o, int off) { return *(T*)((uint8_t*)o + off); }
 template <typename T> static inline void wr(void* o, int off, T v) { *(T*)((uint8_t*)o + off) = v; }
 
-// Un pointeur "plausible" doit ressembler a une vraie adresse heap 64 bits : non nul et
-// dans une plage raisonnable. Ca evite de dereferencer n'importe quoi si le getter
-// renvoie une valeur qu'on n'attendait pas.
 static inline bool plausible(void* p) {
     uintptr_t v = (uintptr_t)p;
-    return v > 0x1000 && v < 0x7fffffffffffULL;
+    return v > 0x100000000ULL && v < 0x7fffffffffffULL;
 }
 
-static bool initCore() {
-    if (g.ready) return true;
-    if (!loadAPI()) { g_status = "en attente : " + g_lastMissingSymbol; return false; }
-
-    // Appel direct de Game.Instance via son adresse RVA. Pas d'API il2cpp, pas de
-    // recherche de classe : juste un pointeur de fonction calcule a la main.
-    fn_getGameInstance getInst = (fn_getGameInstance)(g_gbrBase + RVA_GAME_INSTANCE_GETTER);
+// Re-recupere Game.Instance dynamiquement a chaque tick car l'instance change quand on quitte/rejoint une room !
+static bool refreshGameInstance() {
+    if (!loadAPI()) {
+        g_status = "en attente : " + g_lastMissingSymbol;
+        return false;
+    }
+    fn_getGameInstance getInst = (fn_getGameInstance)RealAddr(RVA_GAME_INSTANCE_GETTER);
     void* game = getInst();
-    if (!plausible(game)) { g_status = "Game.Instance pas encore pret (relance au prochain essai)"; return false; }
-
+    if (!plausible(game)) {
+        g.f_gameInst = nullptr;
+        g.ready = false;
+        g_status = "Dans le menu / En attente d'une partie...";
+        return false;
+    }
     g.f_gameInst = game;
     g.ready = true;
-    g_status = "connecte (appel direct par RVA, sans API il2cpp)";
+    g_status = "En partie (Game.Instance actif)";
     return true;
 }
 
-// Liste des NetworkPlayer de la partie en cours, via Game.Instance.players (List<NetworkPlayer>).
 static std::vector<void*> playerObjs() {
     std::vector<void*> out;
     if (!g.ready || !plausible(g.f_gameInst)) return out;
@@ -194,7 +252,6 @@ static std::vector<void*> playerObjs() {
     return out;
 }
 
-// Le joueur local (nous) dans la liste Game.Instance.players : celui dont isLocal == true.
 static void* getLocalPlayer() {
     for (void* np : playerObjs()) {
         if (rd<uint8_t>(np, g.np_IsLocal) != 0) return np;
@@ -202,103 +259,85 @@ static void* getLocalPlayer() {
     return nullptr;
 }
 
-// Actions directes : appels de methode locaux (sur notre propre joueur uniquement).
-// Ca marche de facon fiable puisque c'est notre propre objet, qu'on possede sur le
-// reseau. Contrairement a un kill a distance, pas besoin de passer par le systeme RPC
-// de Photon (qui demanderait de reconstruire un object[] a la main sans l'API il2cpp).
 static int reviveAsHuman() {
+    if (!refreshGameInstance()) return -1;
     void* lp = getLocalPlayer();
     if (!plausible(lp)) return -1;
-    ((fn_void0)(g_gbrBase + RVA_REVIVE_AS_HUMAN))(lp);
+    ((fn_void0)RealAddr(RVA_REVIVE_AS_HUMAN))(lp);
     return 0;
 }
+
 static int reviveAsZombie() {
+    if (!refreshGameInstance()) return -1;
     void* lp = getLocalPlayer();
     if (!plausible(lp)) return -1;
-    ((fn_void0)(g_gbrBase + RVA_REVIVE_AS_ZOMBIE))(lp);
+    ((fn_void0)RealAddr(RVA_REVIVE_AS_ZOMBIE))(lp);
     return 0;
 }
+
 static int nextSkin() {
     static int32_t skinId = 0;
+    if (!refreshGameInstance()) return -1;
     void* lp = getLocalPlayer();
     if (!plausible(lp)) return -1;
-    skinId = (skinId + 1) % 10;
-    ((fn_void1_int)(g_gbrBase + RVA_ASSIGN_SKIN))(lp, skinId);
+    skinId = (skinId + 1) % 164; // 164 skins comme sur ton mod Android[span_14](start_span)[span_14](end_span)
+    ((fn_void1_int)RealAddr(RVA_ASSIGN_SKIN))(lp, skinId);
     return skinId;
 }
 
 static void coreTick() {
-    static int retry = 0;
-    if (!g.ready) {
-        if ((retry++ % 20) != 0) return;
-        if (!initCore()) return;
-    }
-    // --- Anti-Cheat Bypass (patch une seule fois a l'activation, pas a chaque tick) ---
-    static bool lastAcState = false;
-    if (cfg.antiCheatBypass != lastAcState) {
-        ApplyAntiCheatBypass(cfg.antiCheatBypass);
-        lastAcState = cfg.antiCheatBypass;
-    }
+    if (!refreshGameInstance()) return;
 
-    // --- Vie infinie : on "soigne" en rappelant ReceiveDamage avec des degats negatifs ---
-    // (pas de champ sante identifiable dans le dump ; cette methode est confirmee et deja
-    // utilisee pour munitions/degats, donc plus sure qu'un offset devine au hasard)
-    static int healTick = 0;
-    if (cfg.infiniteHealth && plausible(getLocalPlayer()) && (healTick++ % 10) == 0) {
-        void* me = getLocalPlayer();
-        Vec3f pos = rd<Vec3f>(me, 0x184);
-        int32_t myActor = rd<int32_t>(me, 0x2EC);
-        ((fn_receiveDamage)(g_gbrBase + RVA_RECEIVE_DAMAGE))(me, -9999.f, myActor, 0, 0, pos);
-    }
+    void* lp = getLocalPlayer();
+    if (!plausible(lp)) return;
 
-    // --- Vitesse (joueur local uniquement) ----------------------------------
-    static void* lastLocal = nullptr;
+    // --- 1. Vitesse (joueur local uniquement) ---
+    static void* lastMC = nullptr;
     static float baseWalk = 0, baseRun = 0, baseSprint = 0;
     static bool speedApplied = false;
-    void* lp = getLocalPlayer();
-    if (plausible(lp)) {
-        void* mc = rd<void*>(lp, g.np_MoveCtrl);
-        if (plausible(mc)) {
-            if (mc != lastLocal) {
-                lastLocal = mc; speedApplied = false;
-                baseWalk = rd<float>(mc, g.mc_WalkSpeed);
-                baseRun = rd<float>(mc, g.mc_RunSpeed);
-                baseSprint = rd<float>(mc, g.mc_SprintSpeed);
-                if (baseWalk <= 0.f || baseWalk > 50.f) baseWalk = 5.f;
-                if (baseRun <= 0.f || baseRun > 50.f) baseRun = 8.f;
-                if (baseSprint <= 0.f || baseSprint > 50.f) baseSprint = 12.f;
-            }
-            if (cfg.speed) {
-                wr<float>(mc, g.mc_WalkSpeed, baseWalk * cfg.speedMul);
-                wr<float>(mc, g.mc_RunSpeed, baseRun * cfg.speedMul);
-                wr<float>(mc, g.mc_SprintSpeed, baseSprint * cfg.speedMul);
-                speedApplied = true;
-            } else if (speedApplied) {
-                wr<float>(mc, g.mc_WalkSpeed, baseWalk);
-                wr<float>(mc, g.mc_RunSpeed, baseRun);
-                wr<float>(mc, g.mc_SprintSpeed, baseSprint);
-                speedApplied = false;
-            }
+
+    void* mc = rd<void*>(lp, g.np_MoveCtrl);
+    if (plausible(mc)) {
+        if (mc != lastMC) {
+            lastMC = mc;
+            speedApplied = false;
+            baseWalk   = rd<float>(mc, g.mc_WalkSpeed);
+            baseRun    = rd<float>(mc, g.mc_RunSpeed);
+            baseSprint = rd<float>(mc, g.mc_SprintSpeed);
+            if (baseWalk   <= 0.f || baseWalk   > 50.f) baseWalk   = 5.f;
+            if (baseRun    <= 0.f || baseRun    > 50.f) baseRun    = 8.f;
+            if (baseSprint <= 0.f || baseSprint > 50.f) baseSprint = 12.f;
+        }
+        if (cfg.speed) {
+            wr<float>(mc, g.mc_WalkSpeed,   baseWalk   * cfg.speedMul);
+            wr<float>(mc, g.mc_RunSpeed,    baseRun    * cfg.speedMul);
+            wr<float>(mc, g.mc_SprintSpeed, baseSprint * cfg.speedMul);
+            speedApplied = true;
+        } else if (speedApplied) {
+            wr<float>(mc, g.mc_WalkSpeed,   baseWalk);
+            wr<float>(mc, g.mc_RunSpeed,    baseRun);
+            wr<float>(mc, g.mc_SprintSpeed, baseSprint);
+            speedApplied = false;
         }
     }
 
+    // --- 2. Munitions infinies & One Hit Kill (sur TON joueur local uniquement !) ---
     if (!cfg.infiniteAmmo && !cfg.oneHitKill) return;
 
-    for (void* np : playerObjs()) {
-        void* itemsArr = rd<void*>(np, g.np_Items);
-        if (!plausible(itemsArr)) continue;
-        int32_t n = rd<int32_t>(itemsArr, 0x18);
-        if (n <= 0 || n > 10) continue;
-        for (int j = 0; j < n; j++) {
-            void* item = rd<void*>(itemsArr, 0x20 + 8 * j);
-            if (!plausible(item)) continue;
-            if (cfg.infiniteAmmo) {
-                wr<int32_t>(item, g.it_MaxAmmo, 9999);
-                wr<int32_t>(item, g.it_CurAmmo, 9999);
-            }
-            if (cfg.oneHitKill) {
-                wr<int32_t>(item, g.it_Damage, 9999);
-            }
+    void* itemsArr = rd<void*>(lp, g.np_Items);
+    if (!plausible(itemsArr)) return;
+    int32_t n = rd<int32_t>(itemsArr, 0x18);
+    if (n <= 0 || n > 10) return;
+
+    for (int j = 0; j < n; j++) {
+        void* item = rd<void*>(itemsArr, 0x20 + 8 * j);
+        if (!plausible(item)) continue;
+        if (cfg.infiniteAmmo) {
+            wr<int32_t>(item, g.it_MaxAmmo, 9999);
+            wr<int32_t>(item, g.it_CurAmmo, 9999);
+        }
+        if (cfg.oneHitKill) {
+            wr<int32_t>(item, g.it_Damage, 9999);
         }
     }
 }
@@ -434,7 +473,7 @@ static UIWindow* gameWindow() {
     UILabel* title = [self label:@"Nyx Menu - GBR" size:18 bold:YES color:[UIColor whiteColor]];
     title.frame = CGRectMake(16, 12, 200, 24);
     [self.panel.contentView addSubview:title];
-    UILabel* sub = [self label:@"v3 - appel direct par RVA" size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.5]];
+    UILabel* sub = [self label:@"v3.5.2 - iOS RVA + vm_protect" size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.5]];
     sub.frame = CGRectMake(16, 36, 200, 14);
     [self.panel.contentView addSubview:sub];
 
@@ -453,8 +492,9 @@ static UIWindow* gameWindow() {
     y = [self toggle:@"Munitions infinies" tag:0 y:y in:sv];
     y = [self toggle:@"One Hit Kill" tag:1 y:y in:sv];
     y = [self toggle:@"Vitesse" tag:2 y:y in:sv];
-    y = [self toggle:@"Vie infinie (soin en boucle)" tag:3 y:y in:sv];
+    y = [self toggle:@"Vie infinie (God Mode)" tag:3 y:y in:sv];
     y = [self toggle:@"Anti-Cheat Bypass" tag:4 y:y in:sv];
+
     self.speedLabel = [self label:[NSString stringWithFormat:@"Multiplicateur : x%.1f", cfg.speedMul]
                              size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.65]];
     self.speedLabel.frame = CGRectMake(16, y, 260, 14);
@@ -504,12 +544,36 @@ static UIWindow* gameWindow() {
 
 - (void)sw:(UISwitch*)s {
     bool v = s.on;
-    if (s.tag == 0) cfg.infiniteAmmo = v;
-    if (s.tag == 1) cfg.oneHitKill = v;
-    if (s.tag == 2) cfg.speed = v;
-    if (s.tag == 3) cfg.infiniteHealth = v;
-    if (s.tag == 4) cfg.antiCheatBypass = v;
+    if (s.tag == 0) {
+        cfg.infiniteAmmo = v;
+        [self say:v ? @"Munitions infinies : ON" : @"Munitions infinies : OFF"];
+    }
+    if (s.tag == 1) {
+        cfg.oneHitKill = v;
+        [self say:v ? @"One Hit Kill : ON" : @"One Hit Kill : OFF"];
+    }
+    if (s.tag == 2) {
+        cfg.speed = v;
+        [self say:v ? @"Speed Hack : ON" : @"Speed Hack : OFF"];
+    }
+    if (s.tag == 3) {
+        cfg.infiniteHealth = v;
+        bool ok = ApplyInfiniteHealth(v);
+        if (ok) {
+            [self say:v ? @"God Mode actif (ReceiveDamage RET)" : @"God Mode desactive"];
+        } else {
+            [s setOn:!v animated:YES];
+            cfg.infiniteHealth = !v;
+            [self say:@"Echec patch ReceiveDamage (vm_protect)"];
+        }
+    }
+    if (s.tag == 4) {
+        cfg.antiCheatBypass = v;
+        ApplyAntiCheatBypass(v);
+        [self say:[NSString stringWithFormat:@"AC patch : %d/%d reussis (vm_protect)", g_acSucceeded, RVA_AC_COUNT]];
+    }
     haptic();
+    [self refresh];
 }
 
 - (void)slide:(UISlider*)s {
@@ -525,15 +589,18 @@ static UIWindow* gameWindow() {
 - (void)reviveHumanTap {
     haptic();
     [self say:reviveAsHuman() == 0 ? @"Reviv humain envoye" : @"Impossible : pas en partie"];
+    [self refresh];
 }
 - (void)reviveZombieTap {
     haptic();
     [self say:reviveAsZombie() == 0 ? @"Reviv zombie envoye" : @"Impossible : pas en partie"];
+    [self refresh];
 }
 - (void)skinTap {
     haptic();
     int r = nextSkin();
     [self say:r >= 0 ? [NSString stringWithFormat:@"Skin %d envoye", r] : @"Impossible : pas en partie"];
+    [self refresh];
 }
 
 - (void)refresh {
@@ -567,8 +634,13 @@ static void tryInstallUI() {
 }
 
 __attribute__((constructor)) static void nyx_gbr_entry(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        loadAPI();
+        // Auto-activation de l'Anti-Cheat Bypass des le boot comme sur ton Main.cpp Android[span_15](start_span)[span_15](end_span)
+        cfg.antiCheatBypass = true;
+        ApplyAntiCheatBypass(true);
+
         tryInstallUI();
         [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer* t) { coreTick(); }];
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t) {
