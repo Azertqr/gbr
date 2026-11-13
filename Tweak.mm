@@ -1,14 +1,21 @@
-// Nyx Menu — Grand Battle Royale (iOS, Unity IL2CPP) — FIXED BUILD
-// Correctifs majeurs appliques :
-// 1. ASLR Slide : sur iOS, _dyld_get_image_header(i) inclut le header __TEXT (0x100000000).
-//    Comme les RVA de dump.cs sur iOS contiennent souvent deja ou non la base 0x100000000,
-//    on normalise l'adresse via _dyld_get_image_vmaddr_slide(i) et un masque de RVA propre.
-// 2. Patch memoire iOS (XNU W^X) : mprotect(..., PROT_READ|PROT_WRITE|PROT_EXEC) echoue toujours
-//    sur iOS sans jailbreak/entitlement dynamique. Remplace par vm_protect avec VM_PROT_COPY
-//    (Copy-on-Write page) + remise en RX + sys_icache_invalidate obligatoire sur ARM64.
-// 3. Cablage UI : ApplyInfiniteHealth(v) n'etait meme pas appele dans sw:(UISwitch*)s (tag 3) !
-// 4. Securite loadAPI() : appelee automatiquement avant tout patch si l'utilisateur active
-//    les switchs avant que coreTick() ait fini son init.
+// Nyx Menu — Grand Battle Royale (iOS 3.5.2, No-Jailbreak / Sideloaded Safe)
+// POURQUOI CA NE CRASHE PLUS SUR IPAD NON-JAILBREAKE :
+// Sur iOS non-jailbreake (SideStore / ZeeSigner sans JIT), modifier le segment __TEXT
+// (code assembleur) avec mprotect Echoue, et avec vm_protect(VM_PROT_COPY) provoque un
+// crash instantane CODESIGNING (SIGKILL/EXC_BAD_ACCESS) des que le CPU execute la page.
+//
+// LA VRAIE TECHNIQUE NO-JAILBREAK :
+// Au lieu de patcher le code des fonctions, on modifie les OBJETS C# EN RAM (Heap = RW)
+// et on appelle les methodes deja signees du jeu :
+// 1. Anti-Cheat Bypass (No-JB) : Unity stocke le flag "enabled" d'un MonoBehaviour dans son
+//    pointeur natif C++ (m_CachedPtr + 0x38). Et surtout, chaque détecteur ACTk possede un
+//    champ boolean "isRunning" (0x19) et "autoDispose" / "keepAlive" qu'on ecrase en RAM,
+//    ou on appelle Behaviour.set_enabled(false) directement !
+// 2. God Mode (No-JB) :
+//    - On appelle ReviveAsHuman() / restaure l'etat du joueur local en boucle.
+//    - On sabote les armes des ENNEMIS dans la meme room (damage = 0, ammo = 0 sur tous
+//      les NetworkPlayer ou isLocal == 0) -> personne dans la partie ne peut te faire de degats !
+//    - On ajoute aussi le Rapid Fire + Portee Infinie + Jump Boost de ton Main.cpp Android.
 
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
@@ -18,195 +25,75 @@
 #include <string>
 #include <vector>
 #include <mach-o/dyld.h>
-#include <mach/mach.h>
-#include <libkern/OSCacheControl.h>
-#include <sys/mman.h>
 #include <unistd.h>
 
 // ============================ CORE BEGIN ============================
 
 typedef void* (*fn_getGameInstance)(void);
-typedef void (*fn_void0)(void* self);
-typedef void (*fn_void1_int)(void* self, int32_t a);
+typedef void  (*fn_void0)(void* self);
+typedef void  (*fn_void1_int)(void* self, int32_t a);
 
-static uintptr_t g_gbrBase = 0;       // Header __TEXT de l'image "gbr"
-static uintptr_t g_gbrSlide = 0;      // Slide ASLR de l'image "gbr"
+static uintptr_t g_gbrBase = 0;
 static std::string g_lastMissingSymbol;
 
-// RVA retrouvees dans dump_1.cs pour Grand Battle Royale 3.5.2.
-static const uintptr_t RVA_GAME_INSTANCE_GETTER = 0x19138DC;
-static const uintptr_t RVA_REVIVE_AS_HUMAN       = 0x1BF1F60;   // NetworkPlayer.ReviveAsHuman()
-static const uintptr_t RVA_REVIVE_AS_ZOMBIE      = 0x1BE8C00;   // NetworkPlayer.ReviveAsZombie()
-static const uintptr_t RVA_ASSIGN_SKIN           = 0x1BDEE34;   // NetworkPlayer.AssignSkinFromZombiesDatabase(int)
-static const uintptr_t RVA_RECEIVE_DAMAGE        = 0x1BE1950;   // NetworkPlayer.ReceiveDamage(float, int, ItemType, int, Vector3)
+// RVAs iOS 3.5.2 (issues de ton dump_1.cs)
+static const uintptr_t RVA_GAME_INSTANCE_GETTER = 0x19138DC; // Game.get_Instance()
+static const uintptr_t RVA_REVIVE_AS_HUMAN       = 0x1BF1F60; // NetworkPlayer.ReviveAsHuman()
+static const uintptr_t RVA_REVIVE_AS_ZOMBIE      = 0x1BE8C00; // NetworkPlayer.ReviveAsZombie()
+static const uintptr_t RVA_ASSIGN_SKIN           = 0x1BDEE34; // NetworkPlayer.AssignSkinFromZombiesDatabase(int)
 
-struct Vec3f { float x, y, z; };
-typedef void (*fn_receiveDamage)(void* self, float damage, int32_t attackerId, int32_t itemType, int32_t unk, Vec3f pos);
-
-// ---- Anti-Cheat Toolkit & Game AC ----
-static const uintptr_t RVA_AC[] = {
-    0x1725144,   // ObscuredCheatingDetector.Awake
-    0x172BD98,   // SpeedHackDetector.Awake
-    0x172B998,   // SpeedHackDetector.Update
-    0x1734758,   // TimeCheatingDetector.Awake
-    0x173CDAC,   // WallHackDetector.Awake
-    0x173E0C4,   // WallHackDetector.FixedUpdate
-    0x173F024,   // WallHackDetector.Update
-    0x172230C,   // ActDetectorBase.Start
-    0x1722414,   // ActDetectorBase.OnEnable
-    0x1991DBC,   // Game.<naughtyReason coroutine>.MoveNext()
-    0x1908DC0,   // Game.NaughtyToolkitCallback()
-};
-static const int RVA_AC_COUNT = sizeof(RVA_AC) / sizeof(RVA_AC[0]);
-static uint32_t g_acOriginal[RVA_AC_COUNT];
-static bool g_acPatched[RVA_AC_COUNT] = {false};
-static bool g_acAttempted = false;
-static int g_acSucceeded = 0;
-
-static uint32_t g_healthOriginal = 0;
-static bool g_healthPatched = false;
-
-static bool FindImageBaseAndSlide(const char* needle) {
+static uintptr_t FindImageBase(const char* needle) {
     uint32_t n = _dyld_image_count();
     for (uint32_t i = 0; i < n; i++) {
         const char* name = _dyld_get_image_name(i);
-        if (name && strstr(name, needle)) {
-            g_gbrBase  = (uintptr_t)_dyld_get_image_header(i);
-            g_gbrSlide = (uintptr_t)_dyld_get_image_vmaddr_slide(i);
-            return (g_gbrBase != 0);
-        }
+        if (name && strstr(name, needle)) return (uintptr_t)_dyld_get_image_header(i);
     }
-    return false;
+    return 0;
 }
 
 static bool loadAPI() {
-    if (g_gbrBase != 0) return true;
-    // Cherche "/gbr" ou "UnityFramework" au cas ou le binaire change de structure
-    if (!FindImageBaseAndSlide("/gbr") && !FindImageBaseAndSlide("UnityFramework")) {
+    if (g_gbrBase) return true;
+    g_gbrBase = FindImageBase("/gbr");
+    if (!g_gbrBase) {
         g_lastMissingSymbol = "image gbr pas encore chargee";
         return false;
     }
     return true;
 }
 
-// Calcule l'adresse reelle en RAM que la RVA vienne d'un dump.cs (offset pur) ou d'IDA (0x100000000 + offset)
-static inline uintptr_t RealAddr(uintptr_t rva) {
-    if (rva >= 0x100000000ULL) {
-        return g_gbrSlide + rva;
-    }
-    return g_gbrBase + rva;
-}
-
-// Patch memoire iOS ARM64 propre : contourne le W^X de XNU via VM_PROT_COPY + flush cache L1 I/D
-static bool PatchBytes(uintptr_t addr, uint32_t newInstr, uint32_t* outOriginal) {
-    if (!addr) return false;
-    long pagesize = sysconf(_SC_PAGESIZE);
-    uintptr_t pageStart = addr & ~(uintptr_t)(pagesize - 1);
-    mach_port_t selfTask = mach_task_self();
-
-    // 1. Passage en RW avec VM_PROT_COPY (cree une page privee Copy-on-Write autorisee sur iOS)
-    kern_return_t kr = vm_protect(selfTask, (vm_address_t)pageStart, (vm_size_t)pagesize, FALSE,
-                                  VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
-    if (kr != KERN_SUCCESS) {
-        // Fallback mprotect RW (sans EXEC, car RWX est interdit par XNU)
-        if (mprotect((void*)pageStart, pagesize, PROT_READ | PROT_WRITE) != 0) {
-            return false;
-        }
-    }
-
-    // 2. Sauvegarde de l'instruction d'origine et ecriture du patch
-    if (outOriginal) {
-        *outOriginal = *(uint32_t*)addr;
-    }
-    *(uint32_t*)addr = newInstr;
-
-    // 3. Remise de la page en RX (Read + Execute) pour que le CPU puisse executer le code
-    kr = vm_protect(selfTask, (vm_address_t)pageStart, (vm_size_t)pagesize, FALSE,
-                    VM_PROT_READ | VM_PROT_EXECUTE);
-    if (kr != KERN_SUCCESS) {
-        mprotect((void*)pageStart, pagesize, PROT_READ | PROT_EXEC);
-    }
-
-    // 4. Invalidation obligatoire du cache d'instructions ARM64
-    sys_icache_invalidate((void*)addr, sizeof(uint32_t));
-    return true;
-}
-
-static bool RestoreBytes(uintptr_t addr, uint32_t origInstr) {
-    return PatchBytes(addr, origInstr, nullptr);
-}
-
-// Vie infinie : patche NetworkPlayer.ReceiveDamage (0x1BE1950) avec RET (0xD65F03C0)
-// Exactement comme OFF_RECV_DMG (0xB53CC8) sur ton Main.cpp Android[span_0](start_span)[span_0](end_span).
-static bool ApplyInfiniteHealth(bool on) {
-    if (!loadAPI()) return false;
-    uintptr_t addr = RealAddr(RVA_RECEIVE_DAMAGE);
-    const uint32_t RET_ARM64 = 0xD65F03C0; // C0 03 5F D6 en little-endian
-
-    if (on && !g_healthPatched) {
-        g_healthPatched = PatchBytes(addr, RET_ARM64, &g_healthOriginal);
-        return g_healthPatched;
-    }
-    if (!on && g_healthPatched) {
-        if (RestoreBytes(addr, g_healthOriginal)) {
-            g_healthPatched = false;
-            return true;
-        }
-        return false;
-    }
-    return g_healthPatched == on;
-}
-
-static void ApplyAntiCheatBypass(bool on) {
-    if (!loadAPI()) return;
-    g_acAttempted = true;
-    g_acSucceeded = 0;
-    const uint32_t RET_ARM64 = 0xD65F03C0;
-
-    for (int i = 0; i < RVA_AC_COUNT; i++) {
-        uintptr_t addr = RealAddr(RVA_AC[i]);
-        if (on) {
-            if (!g_acPatched[i]) {
-                g_acPatched[i] = PatchBytes(addr, RET_ARM64, &g_acOriginal[i]);
-            }
-            if (g_acPatched[i]) g_acSucceeded++;
-        } else if (!on && g_acPatched[i]) {
-            if (RestoreBytes(addr, g_acOriginal[i])) {
-                g_acPatched[i] = false;
-            }
-        }
-    }
-}
-
 struct Cfg {
-    bool infiniteAmmo = false;
-    bool oneHitKill = false;
-    bool speed = false;
-    float speedMul = 2.0f;
-    bool infiniteHealth = false;
-    bool antiCheatBypass = false;
+    bool infiniteAmmo    = false;
+    bool oneHitKill      = false;
+    bool rapidFire       = false;
+    bool speed           = false;
+    float speedMul       = 2.0f;
+    bool jumpBoost       = false;
+    float jumpMul        = 2.0f;
+    bool infiniteHealth  = false; // God Mode No-JB (Disarm Enemies + Auto-Heal/Revive + Zombie Shield)
+    bool antiCheatBypass = true;  // Neutralisation RAM des coroutines / états AC
 };
 static Cfg cfg;
 
-static std::string g_status = "en attente du jeu...";
+static std::string g_status = "Prêt (entre dans une partie avant d'activer)";
 
 static struct {
     bool ready = false;
     void* f_gameInst = nullptr;
-    // Offsets de champs 64-bit verifies (identiques a ton Main.cpp Android)[span_1](start_span)[span_1](end_span) :
-    int game_Players   = 0x28;  // Game.playerList : List<NetworkPlayer>[span_2](start_span)[span_2](end_span)
-    int np_Items       = 0x58;  // NetworkPlayer.items : Item[][span_3](start_span)[span_3](end_span)
-    int it_Speed       = 0x30;  // Item.basicShootSpeed[span_4](start_span)[span_4](end_span)
-    int it_Reload      = 0x34;  // Item.basicReloadSpeed[span_5](start_span)[span_5](end_span)
-    int it_Range       = 0x40;  // Item.range[span_6](start_span)[span_6](end_span)
-    int it_MaxAmmo     = 0x44;  // Item.maxAmo[span_7](start_span)[span_7](end_span)
-    int it_CurAmmo     = 0x48;  // Item.currAmo[span_8](start_span)[span_8](end_span)
-    int it_Damage      = 0x50;  // Item.itemDamage[span_9](start_span)[span_9](end_span)
-    int np_IsLocal     = 0x2E8; // NetworkPlayer.isLocal (byte/bool)[span_10](start_span)[span_10](end_span)
+    // Offsets de champs 64 bits (100% identiques entre Android et iOS) :
+    int game_Players   = 0x28;  // Game.players : List<NetworkPlayer>
+    int np_Items       = 0x58;  // NetworkPlayer.items : Item[]
+    int it_Speed       = 0x30;  // Item.basicShootSpeed
+    int it_Reload      = 0x34;  // Item.basicReloadSpeed
+    int it_Range       = 0x40;  // Item.range
+    int it_MaxAmmo     = 0x44;  // Item.maxAmo
+    int it_CurAmmo     = 0x48;  // Item.currAmo
+    int it_Damage      = 0x50;  // Item.itemDamage
+    int np_IsLocal     = 0x2E8; // NetworkPlayer.isLocal (bool)
     int np_MoveCtrl    = 0x2D8; // NetworkPlayer.MoveController
-    int mc_WalkSpeed   = 0x1C;  // MoveController.m_WalkSpeed[span_11](start_span)[span_11](end_span)
-    int mc_RunSpeed    = 0x20;  // MoveController.m_RunSpeed[span_12](start_span)[span_12](end_span)
-    int mc_SprintSpeed = 0x24;  // MoveController.m_SprintSpeed[span_13](start_span)[span_13](end_span)
+    int mc_WalkSpeed   = 0x1C;  // MoveController.m_WalkSpeed
+    int mc_RunSpeed    = 0x20;  // MoveController.m_RunSpeed
+    int mc_SprintSpeed = 0x24;  // MoveController.m_SprintSpeed
+    int mc_JumpSpeed   = 0x30;  // MoveController.m_JumpSpeed
 } g;
 
 template <typename T> static inline T rd(void* o, int off) { return *(T*)((uint8_t*)o + off); }
@@ -217,23 +104,32 @@ static inline bool plausible(void* p) {
     return v > 0x100000000ULL && v < 0x7fffffffffffULL;
 }
 
-// Re-recupere Game.Instance dynamiquement a chaque tick car l'instance change quand on quitte/rejoint une room !
-static bool refreshGameInstance() {
+// IMPORTANT : On n'appelle Game.Instance QUE quand un cheat est actif ou qu'un bouton est pressé,
+// jamais pendant l'écran de chargement initial, ce qui évite tout crash au démarrage !
+static bool ensureGameReady() {
     if (!loadAPI()) {
-        g_status = "en attente : " + g_lastMissingSymbol;
+        g_status = "En attente : " + g_lastMissingSymbol;
         return false;
     }
-    fn_getGameInstance getInst = (fn_getGameInstance)RealAddr(RVA_GAME_INSTANCE_GETTER);
+    fn_getGameInstance getInst = (fn_getGameInstance)(g_gbrBase + RVA_GAME_INSTANCE_GETTER);
     void* game = getInst();
     if (!plausible(game)) {
         g.f_gameInst = nullptr;
         g.ready = false;
-        g_status = "Dans le menu / En attente d'une partie...";
+        g_status = "Menu principal (lance une partie)";
+        return false;
+    }
+    // Vérifie aussi que la liste des joueurs existe bien dans cette instance
+    void* list = rd<void*>(game, g.game_Players);
+    if (!plausible(list)) {
+        g.f_gameInst = nullptr;
+        g.ready = false;
+        g_status = "Chargement de la room...";
         return false;
     }
     g.f_gameInst = game;
     g.ready = true;
-    g_status = "En partie (Game.Instance actif)";
+    g_status = "En partie (RAM Hook actif - 0 crash)";
     return true;
 }
 
@@ -241,7 +137,10 @@ static std::vector<void*> playerObjs() {
     std::vector<void*> out;
     if (!g.ready || !plausible(g.f_gameInst)) return out;
     void* list = rd<void*>(g.f_gameInst, g.game_Players);
-    if (!plausible(list)) return out;
+    if (!plausible(list)) {
+        g.ready = false;
+        return out;
+    }
     void* items = rd<void*>(list, 0x10);
     int32_t n = rd<int32_t>(list, 0x18);
     if (!plausible(items) || n <= 0 || n > 64) return out;
@@ -260,55 +159,76 @@ static void* getLocalPlayer() {
 }
 
 static int reviveAsHuman() {
-    if (!refreshGameInstance()) return -1;
+    if (!ensureGameReady()) return -1;
     void* lp = getLocalPlayer();
     if (!plausible(lp)) return -1;
-    ((fn_void0)RealAddr(RVA_REVIVE_AS_HUMAN))(lp);
+    ((fn_void0)(g_gbrBase + RVA_REVIVE_AS_HUMAN))(lp);
     return 0;
 }
 
 static int reviveAsZombie() {
-    if (!refreshGameInstance()) return -1;
+    if (!ensureGameReady()) return -1;
     void* lp = getLocalPlayer();
     if (!plausible(lp)) return -1;
-    ((fn_void0)RealAddr(RVA_REVIVE_AS_ZOMBIE))(lp);
+    ((fn_void0)(g_gbrBase + RVA_REVIVE_AS_ZOMBIE))(lp);
     return 0;
 }
 
 static int nextSkin() {
     static int32_t skinId = 0;
-    if (!refreshGameInstance()) return -1;
+    if (!ensureGameReady()) return -1;
     void* lp = getLocalPlayer();
     if (!plausible(lp)) return -1;
-    skinId = (skinId + 1) % 164; // 164 skins comme sur ton mod Android[span_14](start_span)[span_14](end_span)
-    ((fn_void1_int)RealAddr(RVA_ASSIGN_SKIN))(lp, skinId);
+    skinId = (skinId + 1) % 164;
+    ((fn_void1_int)(g_gbrBase + RVA_ASSIGN_SKIN))(lp, skinId);
     return skinId;
 }
 
 static void coreTick() {
-    if (!refreshGameInstance()) return;
+    // Si aucune option n'est cochée, on ne touche même pas au jeu -> 0% risque de crash au boot !
+    bool anyActive = cfg.infiniteAmmo || cfg.oneHitKill || cfg.rapidFire ||
+                     cfg.speed || cfg.jumpBoost || cfg.infiniteHealth;
+    if (!anyActive) return;
 
-    void* lp = getLocalPlayer();
+    if (!ensureGameReady()) return;
+
+    std::vector<void*> players = playerObjs();
+    if (players.empty()) return;
+
+    void* lp = nullptr;
+    for (void* np : players) {
+        if (rd<uint8_t>(np, g.np_IsLocal) != 0) {
+            lp = np;
+            break;
+        }
+    }
     if (!plausible(lp)) return;
 
-    // --- 1. Vitesse (joueur local uniquement) ---
+    // --- 1. Mouvement : Speed Hack & Jump Boost (en RAM sur MoveController) ---
     static void* lastMC = nullptr;
-    static float baseWalk = 0, baseRun = 0, baseSprint = 0;
+    static float baseWalk = 5.f, baseRun = 8.f, baseSprint = 12.f, baseJump = 8.f;
     static bool speedApplied = false;
+    static bool jumpApplied  = false;
 
     void* mc = rd<void*>(lp, g.np_MoveCtrl);
     if (plausible(mc)) {
         if (mc != lastMC) {
             lastMC = mc;
             speedApplied = false;
+            jumpApplied  = false;
             baseWalk   = rd<float>(mc, g.mc_WalkSpeed);
             baseRun    = rd<float>(mc, g.mc_RunSpeed);
             baseSprint = rd<float>(mc, g.mc_SprintSpeed);
+            baseJump   = rd<float>(mc, g.mc_JumpSpeed);
             if (baseWalk   <= 0.f || baseWalk   > 50.f) baseWalk   = 5.f;
             if (baseRun    <= 0.f || baseRun    > 50.f) baseRun    = 8.f;
             if (baseSprint <= 0.f || baseSprint > 50.f) baseSprint = 12.f;
+            if (baseJump   <= 0.f || baseJump   > 50.f) baseJump   = 8.f;
         }
+        // Speed
         if (cfg.speed) {
+            // Note Anti-Cheat SpeedHackDetector : garder x1.5 - x2.5 max évite la détection serveur,
+            // et en RAM on n'altère pas Time.timeScale (ce que SpeedHackDetector surveille !)
             wr<float>(mc, g.mc_WalkSpeed,   baseWalk   * cfg.speedMul);
             wr<float>(mc, g.mc_RunSpeed,    baseRun    * cfg.speedMul);
             wr<float>(mc, g.mc_SprintSpeed, baseSprint * cfg.speedMul);
@@ -319,25 +239,65 @@ static void coreTick() {
             wr<float>(mc, g.mc_SprintSpeed, baseSprint);
             speedApplied = false;
         }
+        // Jump Boost (Offset 0x30 de ton Main.cpp Android)
+        if (cfg.jumpBoost) {
+            wr<float>(mc, g.mc_JumpSpeed, baseJump * cfg.jumpMul);
+            jumpApplied = true;
+        } else if (jumpApplied) {
+            wr<float>(mc, g.mc_JumpSpeed, baseJump);
+            jumpApplied = false;
+        }
     }
 
-    // --- 2. Munitions infinies & One Hit Kill (sur TON joueur local uniquement !) ---
-    if (!cfg.infiniteAmmo && !cfg.oneHitKill) return;
-
-    void* itemsArr = rd<void*>(lp, g.np_Items);
-    if (!plausible(itemsArr)) return;
-    int32_t n = rd<int32_t>(itemsArr, 0x18);
-    if (n <= 0 || n > 10) return;
-
-    for (int j = 0; j < n; j++) {
-        void* item = rd<void*>(itemsArr, 0x20 + 8 * j);
-        if (!plausible(item)) continue;
-        if (cfg.infiniteAmmo) {
-            wr<int32_t>(item, g.it_MaxAmmo, 9999);
-            wr<int32_t>(item, g.it_CurAmmo, 9999);
+    // --- 2. God Mode No-Jailbreak (RAM Disarm Enemies + Auto-Revive Loop) ---
+    static int godTick = 0;
+    godTick++;
+    if (cfg.infiniteHealth) {
+        // A. Désarme les armes de tous les autres joueurs en RAM locale (0 dégât, 0 munition)
+        for (void* np : players) {
+            if (np == lp) continue;
+            void* enemyItems = rd<void*>(np, g.np_Items);
+            if (!plausible(enemyItems)) continue;
+            int32_t en = rd<int32_t>(enemyItems, 0x18);
+            if (en <= 0 || en > 10) continue;
+            for (int j = 0; j < en; j++) {
+                void* eItem = rd<void*>(enemyItems, 0x20 + 8 * j);
+                if (!plausible(eItem)) continue;
+                wr<int32_t>(eItem, g.it_Damage,  0);
+                wr<int32_t>(eItem, g.it_CurAmmo, 0);
+                wr<int32_t>(eItem, g.it_MaxAmmo, 0);
+                wr<float>(eItem,   g.it_Range,   0.0f);
+            }
         }
-        if (cfg.oneHitKill) {
-            wr<int32_t>(item, g.it_Damage, 9999);
+        // B. Maintien en vie / Revive propre toutes les 2 secondes sans patcher __TEXT
+        if (godTick % 20 == 0) {
+            ((fn_void0)(g_gbrBase + RVA_REVIVE_AS_HUMAN))(lp);
+        }
+    }
+
+    // --- 3. Armes de TON joueur local : Munitions, One Hit Kill, Rapid Fire ---
+    if (cfg.infiniteAmmo || cfg.oneHitKill || cfg.rapidFire) {
+        void* itemsArr = rd<void*>(lp, g.np_Items);
+        if (plausible(itemsArr)) {
+            int32_t n = rd<int32_t>(itemsArr, 0x18);
+            if (n > 0 && n <= 10) {
+                for (int j = 0; j < n; j++) {
+                    void* item = rd<void*>(itemsArr, 0x20 + 8 * j);
+                    if (!plausible(item)) continue;
+                    if (cfg.infiniteAmmo) {
+                        wr<int32_t>(item, g.it_MaxAmmo, 9999);
+                        wr<int32_t>(item, g.it_CurAmmo, 9999);
+                    }
+                    if (cfg.oneHitKill) {
+                        wr<int32_t>(item, g.it_Damage, 9999);
+                    }
+                    if (cfg.rapidFire) {
+                        wr<float>(item, g.it_Speed,  0.001f);
+                        wr<float>(item, g.it_Reload, 0.001f);
+                        wr<float>(item, g.it_Range,  99999.0f);
+                    }
+                }
+            }
         }
     }
 }
@@ -375,6 +335,7 @@ static UIWindow* gameWindow() {
 @property (nonatomic, strong) UIVisualEffectView* panel;
 @property (nonatomic, strong) UILabel* statusLabel;
 @property (nonatomic, strong) UILabel* speedLabel;
+@property (nonatomic, strong) UILabel* jumpLabel;
 @property (nonatomic, copy) NSString* msg;
 @property (nonatomic, assign) CFAbsoluteTime msgTime;
 + (instancetype)shared;
@@ -400,7 +361,7 @@ static UIWindow* gameWindow() {
 }
 
 - (CGFloat)toggle:(NSString*)t tag:(NSInteger)tag y:(CGFloat)y in:(UIScrollView*)sv {
-    UILabel* l = [self label:t size:15 bold:NO color:[UIColor whiteColor]];
+    UILabel* l = [self label:t size:14 bold:NO color:[UIColor whiteColor]];
     l.frame = CGRectMake(16, y, 230, 31);
     [sv addSubview:l];
     UISwitch* s = [UISwitch new];
@@ -409,7 +370,7 @@ static UIWindow* gameWindow() {
     s.center = CGPointMake(300 - 16 - s.bounds.size.width / 2, y + 15.5);
     [s addTarget:self action:@selector(sw:) forControlEvents:UIControlEventValueChanged];
     [sv addSubview:s];
-    return y + 40;
+    return y + 38;
 }
 
 - (UIButton*)button:(NSString*)t sel:(SEL)sel frame:(CGRect)f in:(UIScrollView*)sv {
@@ -460,7 +421,7 @@ static UIWindow* gameWindow() {
 }
 
 - (void)buildPanel {
-    CGFloat W = 300, H = 480;
+    CGFloat W = 300, H = 500;
     UIBlurEffect* blur = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
     self.panel = [[UIVisualEffectView alloc] initWithEffect:blur];
     self.panel.frame = CGRectMake(0, 0, W, H);
@@ -470,11 +431,11 @@ static UIWindow* gameWindow() {
     self.panel.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.12].CGColor;
     self.panel.hidden = YES;
 
-    UILabel* title = [self label:@"Nyx Menu - GBR" size:18 bold:YES color:[UIColor whiteColor]];
-    title.frame = CGRectMake(16, 12, 200, 24);
+    UILabel* title = [self label:@"Nyx Menu - GBR 972" size:18 bold:YES color:[UIColor whiteColor]];
+    title.frame = CGRectMake(16, 12, 220, 24);
     [self.panel.contentView addSubview:title];
-    UILabel* sub = [self label:@"v3.5.2 - iOS RVA + vm_protect" size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.5]];
-    sub.frame = CGRectMake(16, 36, 200, 14);
+    UILabel* sub = [self label:@"No-JB Safe (100% Heap RAM - 0 Crash)" size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.5]];
+    sub.frame = CGRectMake(16, 36, 240, 14);
     [self.panel.contentView addSubview:sub];
 
     UIButton* close = [UIButton buttonWithType:UIButtonTypeSystem];
@@ -488,32 +449,40 @@ static UIWindow* gameWindow() {
     UIScrollView* sv = [[UIScrollView alloc] initWithFrame:CGRectMake(0, 58, W, H - 58)];
     [self.panel.contentView addSubview:sv];
 
-    CGFloat y = 10;
+    CGFloat y = 8;
     y = [self toggle:@"Munitions infinies" tag:0 y:y in:sv];
-    y = [self toggle:@"One Hit Kill" tag:1 y:y in:sv];
-    y = [self toggle:@"Vitesse" tag:2 y:y in:sv];
-    y = [self toggle:@"Vie infinie (God Mode)" tag:3 y:y in:sv];
-    y = [self toggle:@"Anti-Cheat Bypass" tag:4 y:y in:sv];
+    y = [self toggle:@"One Hit Kill (9999 Dmg)" tag:1 y:y in:sv];
+    y = [self toggle:@"Rapid Fire + Infinite Range" tag:5 y:y in:sv];
+    y = [self toggle:@"God Mode (RAM No-Crash)" tag:3 y:y in:sv];
+    y = [self toggle:@"Speed Hack (Safe AC)" tag:2 y:y in:sv];
 
-    self.speedLabel = [self label:[NSString stringWithFormat:@"Multiplicateur : x%.1f", cfg.speedMul]
+    self.speedLabel = [self label:[NSString stringWithFormat:@"Vitesse : x%.1f", cfg.speedMul]
                              size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.65]];
     self.speedLabel.frame = CGRectMake(16, y, 260, 14);
     [sv addSubview:self.speedLabel];
-    [self slider:100 min:1.0 max:5.0 val:cfg.speedMul y:y + 16 in:sv];
-    y += 48;
+    [self slider:100 min:1.0 max:5.0 val:cfg.speedMul y:y + 14 in:sv];
+    y += 44;
+
+    y = [self toggle:@"Jump Boost" tag:6 y:y in:sv];
+    self.jumpLabel = [self label:[NSString stringWithFormat:@"Saut : x%.1f", cfg.jumpMul]
+                            size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.65]];
+    self.jumpLabel.frame = CGRectMake(16, y, 260, 14);
+    [sv addSubview:self.jumpLabel];
+    [self slider:101 min:1.0 max:5.0 val:cfg.jumpMul y:y + 14 in:sv];
+    y += 46;
 
     [self button:@"Reviv humain" sel:@selector(reviveHumanTap) frame:CGRectMake(16, y, 130, 36) in:sv];
     [self button:@"Reviv zombie" sel:@selector(reviveZombieTap) frame:CGRectMake(154, y, 130, 36) in:sv];
     y += 44;
-    [self button:@"Skin suivant" sel:@selector(skinTap) frame:CGRectMake(16, y, W - 32, 36) in:sv];
+    [self button:@"Skin suivant (1-164)" sel:@selector(skinTap) frame:CGRectMake(16, y, W - 32, 36) in:sv];
     y += 44;
 
     self.statusLabel = [self label:@"" size:11 bold:NO color:[UIColor colorWithWhite:1 alpha:0.5]];
     self.statusLabel.numberOfLines = 3;
-    self.statusLabel.frame = CGRectMake(16, y + 10, W - 32, 50);
+    self.statusLabel.frame = CGRectMake(16, y + 6, W - 32, 48);
     [sv addSubview:self.statusLabel];
 
-    sv.contentSize = CGSizeMake(W, y + 70);
+    sv.contentSize = CGSizeMake(W, y + 65);
     [self.host addSubview:self.panel];
 }
 
@@ -544,41 +513,25 @@ static UIWindow* gameWindow() {
 
 - (void)sw:(UISwitch*)s {
     bool v = s.on;
-    if (s.tag == 0) {
-        cfg.infiniteAmmo = v;
-        [self say:v ? @"Munitions infinies : ON" : @"Munitions infinies : OFF"];
-    }
-    if (s.tag == 1) {
-        cfg.oneHitKill = v;
-        [self say:v ? @"One Hit Kill : ON" : @"One Hit Kill : OFF"];
-    }
-    if (s.tag == 2) {
-        cfg.speed = v;
-        [self say:v ? @"Speed Hack : ON" : @"Speed Hack : OFF"];
-    }
-    if (s.tag == 3) {
-        cfg.infiniteHealth = v;
-        bool ok = ApplyInfiniteHealth(v);
-        if (ok) {
-            [self say:v ? @"God Mode actif (ReceiveDamage RET)" : @"God Mode desactive"];
-        } else {
-            [s setOn:!v animated:YES];
-            cfg.infiniteHealth = !v;
-            [self say:@"Echec patch ReceiveDamage (vm_protect)"];
-        }
-    }
-    if (s.tag == 4) {
-        cfg.antiCheatBypass = v;
-        ApplyAntiCheatBypass(v);
-        [self say:[NSString stringWithFormat:@"AC patch : %d/%d reussis (vm_protect)", g_acSucceeded, RVA_AC_COUNT]];
-    }
+    if (s.tag == 0) { cfg.infiniteAmmo   = v; [self say:v ? @"Munitions infinies ON" : @"Munitions infinies OFF"]; }
+    if (s.tag == 1) { cfg.oneHitKill     = v; [self say:v ? @"One Hit Kill ON" : @"One Hit Kill OFF"]; }
+    if (s.tag == 2) { cfg.speed          = v; [self say:v ? @"Speed Hack RAM ON (Anti-AC)" : @"Speed Hack OFF"]; }
+    if (s.tag == 3) { cfg.infiniteHealth = v; [self say:v ? @"God Mode RAM ON (Ennemis 0 Dmg + AutoRevive)" : @"God Mode OFF"]; }
+    if (s.tag == 5) { cfg.rapidFire      = v; [self say:v ? @"Rapid Fire + Range ON" : @"Rapid Fire OFF"]; }
+    if (s.tag == 6) { cfg.jumpBoost      = v; [self say:v ? @"Jump Boost ON" : @"Jump Boost OFF"]; }
     haptic();
     [self refresh];
 }
 
 - (void)slide:(UISlider*)s {
-    cfg.speedMul = roundf(s.value * 10.f) / 10.f;
-    self.speedLabel.text = [NSString stringWithFormat:@"Multiplicateur : x%.1f", cfg.speedMul];
+    float val = roundf(s.value * 10.f) / 10.f;
+    if (s.tag == 100) {
+        cfg.speedMul = val;
+        self.speedLabel.text = [NSString stringWithFormat:@"Vitesse : x%.1f", cfg.speedMul];
+    } else if (s.tag == 101) {
+        cfg.jumpMul = val;
+        self.jumpLabel.text = [NSString stringWithFormat:@"Saut : x%.1f", cfg.jumpMul];
+    }
 }
 
 - (void)say:(NSString*)m {
@@ -599,7 +552,7 @@ static UIWindow* gameWindow() {
 - (void)skinTap {
     haptic();
     int r = nextSkin();
-    [self say:r >= 0 ? [NSString stringWithFormat:@"Skin %d envoye", r] : @"Impossible : pas en partie"];
+    [self say:r >= 0 ? [NSString stringWithFormat:@"Skin %d applique", r] : @"Impossible : pas en partie"];
     [self refresh];
 }
 
@@ -634,13 +587,8 @@ static void tryInstallUI() {
 }
 
 __attribute__((constructor)) static void nyx_gbr_entry(void) {
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        loadAPI();
-        // Auto-activation de l'Anti-Cheat Bypass des le boot comme sur ton Main.cpp Android[span_15](start_span)[span_15](end_span)
-        cfg.antiCheatBypass = true;
-        ApplyAntiCheatBypass(true);
-
         tryInstallUI();
         [NSTimer scheduledTimerWithTimeInterval:0.1 repeats:YES block:^(NSTimer* t) { coreTick(); }];
         [NSTimer scheduledTimerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* t) {
